@@ -1,34 +1,16 @@
 // pi-strata — core strata logic.
 //
-// Phase data lives in the conversation, not in files: the model writes each
-// phase between unique markers, and the extension extracts the blocks
-// algorithmically (regex, SPEC §2):
+// Phase data lives in the conversation. The model writes marker blocks and
+// the extension folds them into a deterministic summary. New plans use stable
+// item IDs; numeric STEP-N blocks remain supported for existing sessions.
 //
-//   /*STRATA::RESEARCH::v1*/ … /*STRATA::END::RESEARCH::v1*/
-//   /*STRATA::PLAN::v1*/     … /*STRATA::END::PLAN::v1*/
-//   /*STRATA::STEP-N::v1*/   … /*STRATA::END::STEP-N::v1*/
+// Canonical summary order:
+//   RESEARCH → PLAN → MILESTONE-N → STEP-ID → PLAN-DELTA
 //
-// Extraction semantics — "latest wins": blocks are processed in scan order
-// (previous compaction summary first, then the new conversation span), and a
-// later occurrence of the same phase key replaces the earlier one. A RESEARCH
-// or PLAN block additionally marks the start of a NEW task cycle: every
-// STEP-N report that appeared before it in scan order belongs to the
-// previous cycle and is dropped (a new task must not inherit the old plan's
-// step reports). Reports written after the boundary are kept. The
-// compaction summary is the extracted blocks re-emitted in fixed order, so
-// the next extraction over (summary + new span) rebuilds the prefix
-// byte-stably without any on-disk layer state.
-//
-// Byte-stability contract (SPEC §4):
-//  - extractLayers() and buildStrataSummary() are pure functions;
-//  - every block body is normalized before storage or emission;
-//  - the summary layout is fixed: marker line, then RESEARCH, PLAN,
-//    STEP-1..N (ascending) — joined with exactly SEP ("\n\n");
-//  - allowed prefix mutations: a replaced phase block (corrected research,
-//    plan checkbox toggle), an appended step report.
-//
-// The session strata directory keeps raw context snapshots only (tmp/),
-// written by the extension at compaction time.
+// A new RESEARCH starts a cycle and clears every later layer. A PLAN-DELTA is
+// a full effective-plan snapshot placed after the reports, so status updates
+// do not rewrite the base PLAN. MILESTONE-N blocks archive completed reports
+// when the permanent layer budget is exceeded.
 
 import {
   existsSync,
@@ -41,14 +23,8 @@ import { dirname, join } from "node:path";
 
 export const STRATA_VERSION = "v1";
 export const STRATA_MARKER = `## PI-STRATA CONTEXT (${STRATA_VERSION})`;
-
-/** Strict separator between layers: exactly two newline characters. */
 export const SEP = "\n\n";
 
-/**
- * Normalize phase text: CRLF/CR -> LF, strip trailing whitespace on every
- * line, trim the whole text. Idempotent — applying twice changes nothing.
- */
 export function normalizeText(s: string): string {
   return s
     .replace(/\r\n/g, "\n")
@@ -57,150 +33,212 @@ export function normalizeText(s: string): string {
     .trim();
 }
 
+export function estimateTextTokens(s: string): number {
+  return Math.ceil(s.length / 4);
+}
+
 // ---------------------------------------------------------------------------
 // Marker blocks
 // ---------------------------------------------------------------------------
 
-/** One well-formed phase block (body already normalized). */
 export interface StrataBlock {
-  /** Phase key: "RESEARCH", "PLAN", or "STEP-N". */
   key: string;
-  /** Step number for STEP-N blocks. */
   stepN?: number;
+  milestoneN?: number;
   text: string;
 }
 
-/** Wrap a phase body in its marker pair (the exact tokens the model emits). */
 export function strataBlock(key: string, body: string): string {
   return `/*STRATA::${key}::v1*/\n${normalizeText(body)}\n/*STRATA::END::${key}::v1*/`;
 }
 
-/**
- * All well-formed STRATA:: blocks in `text`, in order of appearance.
- * Unclosed pairs never match; a pair whose body re-opens the same phase
- * (malformed/nested) is skipped, and empty bodies are dropped.
- */
+const BLOCK_SOURCE =
+  /\/\*STRATA::(RESEARCH|PLAN-DELTA|PLAN|MILESTONE-(\d+)|STEP-([A-Za-z0-9][A-Za-z0-9_-]*))::v1\*\/([\s\S]*?)\/\*STRATA::END::\1::v1\*\//g;
+
 export function extractStrataBlocks(text: string): StrataBlock[] {
-  const BLOCK_RE =
-    /\/\*STRATA::(RESEARCH|PLAN|STEP-(\d+))::v1\*\/([\s\S]*?)\/\*STRATA::END::\1::v1\*\//g;
+  const re = new RegExp(BLOCK_SOURCE.source, "g");
   const blocks: StrataBlock[] = [];
-  for (let m = BLOCK_RE.exec(text); m !== null; m = BLOCK_RE.exec(text)) {
+  for (let m = re.exec(text); m !== null; m = re.exec(text)) {
     const key = m[1];
-    const body = normalizeText(m[3]);
+    const body = normalizeText(m[4]);
     if (body.length === 0) continue;
     if (body.includes(`/*STRATA::${key}::v1*/`)) continue;
+    const rawStep = m[3];
+    const stepN =
+      rawStep && /^\d+$/.test(rawStep) && Number.isSafeInteger(Number(rawStep))
+        ? Number(rawStep)
+        : undefined;
     blocks.push({
       key,
-      stepN: m[2] === undefined ? undefined : Number(m[2]),
+      stepN,
+      milestoneN: m[2] === undefined ? undefined : Number(m[2]),
       text: body,
     });
   }
   return blocks;
 }
 
-/**
- * Layered view of the conversation: the extracted phase blocks folded with
- * "latest wins" (a later block of the same phase key replaces the earlier
- * one). A RESEARCH or PLAN block also starts a new task cycle and drops all
- * STEP-N reports that appeared before it. `reports` is sorted by step number.
- */
+export function stripStrataBlocks(text: string): string {
+  return normalizeText(text.replace(new RegExp(BLOCK_SOURCE.source, "g"), ""));
+}
+
+export interface StepReport {
+  key: string;
+  n?: number;
+  text: string;
+}
+
+export interface Milestone {
+  n: number;
+  text: string;
+  completed: string[];
+}
+
 export interface StrataLayers {
   research?: string;
   plan?: string;
-  reports?: { n: number; text: string }[];
+  planDelta?: string;
+  /** False after a RESEARCH until a new base PLAN is emitted. */
+  planFresh?: boolean;
+  reports?: StepReport[];
+  milestones?: Milestone[];
 }
 
-/** Fold blocks into layers; undefined when there are no blocks at all. */
+export function parseMilestoneCompleted(text: string): string[] {
+  const match = text.match(/^Completed-Steps:[ \t]*(.*)$/m);
+  if (!match) return [];
+  return [...new Set(match[1].split(",").map((id) => id.trim()).filter(Boolean))];
+}
+
+export function buildMilestoneText(
+  completed: readonly string[],
+  digest: string,
+): string {
+  return `Completed-Steps: ${[...new Set(completed)].join(",")}\n\n${normalizeText(digest)}`;
+}
+
 export function blocksToLayers(
   blocks: StrataBlock[],
 ): StrataLayers | undefined {
   if (blocks.length === 0) return undefined;
-  const layers: StrataLayers = {};
-  let reports: { n: number; text: string }[] = [];
+  const layers: StrataLayers = { planFresh: false };
+  let reports: StepReport[] = [];
+  let milestones: Milestone[] = [];
   for (const b of blocks) {
-    if (b.key === "RESEARCH" || b.key === "PLAN") {
-      // New task cycle: step reports that appeared before this RESEARCH/PLAN
-      // block belong to the previous cycle and are dropped.
-      if (b.key === "RESEARCH") layers.research = b.text;
-      else layers.plan = b.text;
+    if (b.key === "RESEARCH") {
+      layers.research = b.text;
+      layers.plan = undefined;
+      layers.planDelta = undefined;
+      layers.planFresh = false;
       reports = [];
-    } else if (b.stepN !== undefined) {
-      const i = reports.findIndex((r) => r.n === b.stepN);
-      if (i >= 0) reports[i].text = b.text;
-      else reports.push({ n: b.stepN, text: b.text });
+      milestones = [];
+    } else if (b.key === "PLAN") {
+      layers.plan = b.text;
+      layers.planDelta = undefined;
+      layers.planFresh = true;
+    } else if (b.key === "PLAN-DELTA") {
+      layers.planDelta = b.text;
+    } else if (b.key.startsWith("STEP-")) {
+      const key = b.key.slice(5);
+      const i = reports.findIndex((r) => r.key === key);
+      if (i >= 0) reports[i] = { key, n: b.stepN, text: b.text };
+      else reports.push({ key, n: b.stepN, text: b.text });
+    } else if (b.milestoneN !== undefined) {
+      const milestone = {
+        n: b.milestoneN,
+        text: b.text,
+        completed: parseMilestoneCompleted(b.text),
+      };
+      const i = milestones.findIndex((m) => m.n === b.milestoneN);
+      if (i >= 0) milestones[i] = milestone;
+      else milestones.push(milestone);
     }
   }
-  reports.sort((a, b) => a.n - b.n);
+  reports.sort((a, b) => a.key.localeCompare(b.key, undefined, { numeric: true }));
+  milestones.sort((a, b) => a.n - b.n);
   layers.reports = reports;
+  layers.milestones = milestones;
   return layers;
 }
 
-/** extractStrataBlocks + blocksToLayers in one step (compaction hot path). */
 export function extractLayers(text: string): StrataLayers | undefined {
   return blocksToLayers(extractStrataBlocks(text));
 }
 
-/**
- * Build the strata summary injected as the compaction summary: the marker
- * line followed by the phase blocks in fixed order (RESEARCH, PLAN,
- * STEP-1..N ascending), joined with exactly SEP. Pure and idempotent:
- * identical layers always produce identical bytes.
- */
+export function effectivePlan(layers: StrataLayers): string | undefined {
+  return layers.planDelta ?? layers.plan;
+}
+
 export function buildStrataSummary(layers: StrataLayers): string {
   const out: string[] = [STRATA_MARKER];
   if (layers.research) out.push(strataBlock("RESEARCH", layers.research));
   if (layers.plan) out.push(strataBlock("PLAN", layers.plan));
-  for (const r of layers.reports ?? [])
-    out.push(strataBlock(`STEP-${r.n}`, r.text));
+  for (const m of layers.milestones ?? [])
+    out.push(strataBlock(`MILESTONE-${m.n}`, m.text));
+  for (const r of layers.reports ?? []) {
+    const key = r.key ?? String(r.n);
+    out.push(strataBlock(`STEP-${key}`, r.text));
+  }
+  if (layers.planDelta) out.push(strataBlock("PLAN-DELTA", layers.planDelta));
   return out.join(SEP);
 }
 
 // ---------------------------------------------------------------------------
-// Display: marker anchors hidden in the TUI transcript
+// Display
 // ---------------------------------------------------------------------------
 
-/**
- * Strip STRATA marker anchors from Markdown for display: a marker that owns
- * its line drops the whole line (paragraph spacing is preserved), and an
- * inline marker drops the token itself. Block bodies are kept — the phase
- * content stays readable in the transcript. Display-only: fed to pi's
- * markdown transformer, which renders the result in the TUI while the
- * session and the model context keep the raw markers. Pure, synchronous,
- * idempotent.
- */
 export function stripStrataMarkersForDisplay(md: string): string {
   return md
     .replace(
-      /(^|\n)[ \t]*\/\*STRATA::(?:END::)?(?:RESEARCH|PLAN|STEP-\d+)::v1\*\/[ \t]*\n/g,
+      /(^|\n)[ \t]*\/\*STRATA::(?:END::)?(?:RESEARCH|PLAN-DELTA|PLAN|MILESTONE-\d+|STEP-[A-Za-z0-9][A-Za-z0-9_-]*)::v1\*\/[ \t]*\n/g,
       "$1",
     )
-    .replace(/\/\*STRATA::(?:END::)?(?:RESEARCH|PLAN|STEP-\d+)::v1\*\//g, "");
+    .replace(
+      /\/\*STRATA::(?:END::)?(?:RESEARCH|PLAN-DELTA|PLAN|MILESTONE-\d+|STEP-[A-Za-z0-9][A-Za-z0-9_-]*)::v1\*\//g,
+      "",
+    );
 }
 
 // ---------------------------------------------------------------------------
-// Plan (TODO) parsing — markdown checkboxes
+// Plan and completion state
 // ---------------------------------------------------------------------------
 
-// Checkbox syntax is accepted for compatibility with earlier sessions; new
-// plans use plain markdown bullets (`- action`).
-const PLAN_ITEM_RE = /^\s*[-*+]\s+(?:\[([ xX])\]\s+)?(.*)$/;
+const PLAN_ITEM_RE =
+  /^\s*[-*+]\s+(?:\[([ xX])\]\s+)?(?:\[id:([A-Za-z0-9][A-Za-z0-9_-]*)\]\s+)?(.*)$/;
 
 export interface PlanItem {
+  id: string;
   text: string;
   done: boolean;
+  explicitId: boolean;
 }
 
-/** Extract checkbox items from plan markdown. Non-item lines are ignored. */
 export function parsePlan(md: string): PlanItem[] {
   const items: PlanItem[] = [];
   for (const line of md.split("\n")) {
     const m = line.match(PLAN_ITEM_RE);
-    if (m) items.push({ text: m[2].trim(), done: m[1]?.toLowerCase() === "x" });
+    if (!m) continue;
+    items.push({
+      id: m[2] ?? String(items.length + 1),
+      text: m[3].trim(),
+      done: m[1]?.toLowerCase() === "x",
+      explicitId: m[2] !== undefined,
+    });
   }
   return items;
 }
 
-/** 0-based index of the first unchecked item, or -1 when all done / no plan. */
+export function planIdError(md: string): string | null {
+  const items = parsePlan(md);
+  const seen = new Set<string>();
+  for (const item of items) {
+    if (!item.text) return `Plan item ${item.id} has no action.`;
+    if (seen.has(item.id)) return `Duplicate plan item ID: ${item.id}.`;
+    seen.add(item.id);
+  }
+  return null;
+}
+
 export function firstUnchecked(md: string): number {
   return parsePlan(md).findIndex((t) => !t.done);
 }
@@ -209,51 +247,91 @@ export function itemText(md: string, index: number): string | undefined {
   return parsePlan(md)[index]?.text;
 }
 
+export function itemId(md: string, index: number): string | undefined {
+  return parsePlan(md)[index]?.id;
+}
+
 export function planCounts(md: string): { done: number; total: number } {
   const items = parsePlan(md);
   return { done: items.filter((t) => t.done).length, total: items.length };
 }
 
-/** Progress is append-only: a STEP-N report is the completion record for plan item N. */
+type ReportRef = { key?: string; n?: number };
+type MilestoneRef = { completed: readonly string[] };
+
+const reportKey = (report: ReportRef): string =>
+  report.key ?? String(report.n);
+
+export function completedStepIds(
+  reports: readonly ReportRef[] = [],
+  milestones: readonly MilestoneRef[] = [],
+): Set<string> {
+  const completed = new Set<string>();
+  for (const milestone of milestones)
+    for (const id of milestone.completed) completed.add(id);
+  for (const report of reports) completed.add(reportKey(report));
+  return completed;
+}
+
 export function reportPlanCounts(
   md: string,
-  reports: readonly { n: number }[],
+  reports: readonly ReportRef[],
+  milestones: readonly MilestoneRef[] = [],
 ): { done: number; total: number } {
-  const total = parsePlan(md).length;
-  const completed = new Set<number>();
-  for (const report of reports) {
-    if (report.n >= 1 && report.n <= total) completed.add(report.n);
-  }
-  return { done: completed.size, total };
+  const items = parsePlan(md);
+  const completed = completedStepIds(reports, milestones);
+  return {
+    done: items.filter((item) => completed.has(item.id)).length,
+    total: items.length,
+  };
 }
 
-/** 0-based first plan item without its append-only STEP-N report, or -1. */
 export function firstUnreportedPlanStep(
   md: string,
-  reports: readonly { n: number }[],
+  reports: readonly ReportRef[],
+  milestones: readonly MilestoneRef[] = [],
 ): number {
-  const completed = new Set(reports.map((report) => report.n));
-  return parsePlan(md).findIndex((_item, index) => !completed.has(index + 1));
+  const completed = completedStepIds(reports, milestones);
+  return parsePlan(md).findIndex((item) => !completed.has(item.id));
+}
+
+export function planChangeError(
+  prev: StrataLayers | undefined,
+  next: StrataLayers,
+): string | null {
+  const prevPlan = prev ? effectivePlan(prev) : undefined;
+  const nextPlan = effectivePlan(next);
+  if (!prevPlan || !nextPlan) return null;
+  const nextItems = parsePlan(nextPlan);
+  const nextById = new Map(nextItems.map((item) => [item.id, item]));
+  const completed = completedStepIds(prev?.reports ?? [], prev?.milestones ?? []);
+  for (const item of parsePlan(prevPlan)) {
+    if (!completed.has(item.id)) continue;
+    const replacement = nextById.get(item.id);
+    if (!replacement)
+      return `Plan edit removes completed item ${item.id}; its STEP report must keep the same ID.`;
+    if (replacement.text !== item.text)
+      return `Plan edit changes completed item ${item.id}; completed items are immutable.`;
+  }
+  const archived = completedStepIds([], next.milestones ?? []);
+  for (const report of next.reports ?? []) {
+    if (!nextById.has(report.key) && !archived.has(report.key))
+      return `STEP-${report.key} has no matching plan item ID.`;
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
-// Widgets (pi-lens style): themeable single-line segments
+// Widgets
 // ---------------------------------------------------------------------------
 
-/** Theme colors the widgets use (a subset of pi's ThemeColor). */
 export type WidgetColor = "accent" | "dim" | "success";
 
-/** One colored run of a widget line. */
 export interface WidgetSegment {
   text: string;
   color?: WidgetColor;
 }
 
-/**
- * Short label for a plan item on the one-line dashboard: the part before
- * the first colon (plan items are usually written as "Step N (target):
- * details"), falling back to the full text, capped at 56 chars.
- */
 export function planItemLabel(md: string, index: number): string {
   const t = (itemText(md, index) ?? "").trim();
   const cut = t.indexOf(":");
@@ -261,18 +339,11 @@ export function planItemLabel(md: string, index: number): string {
   return label.length > 56 ? `${label.slice(0, 55)}…` : label;
 }
 
-/**
- * The plan dashboard as a single line of segments (pi-lens style: leading
- * space, accent brand, dim secondary info, colored status):
- *
- *   " strata  2/5 ✓✓▶··  next: #3 <label>"   (✓ success, ▶ accent, · dim)
- *   " strata  research done — plan pending"  (no plan yet)
- *   " strata  pre-plan"                      (no research yet)
- */
 export function planDashboardSegments(
   plan: string | undefined,
-  reports: readonly { n: number }[],
+  reports: readonly ReportRef[],
   hasResearch: boolean,
+  milestones: readonly MilestoneRef[] = [],
 ): WidgetSegment[] {
   const brand: WidgetSegment = { text: " strata", color: "accent" };
   if (!plan) {
@@ -284,24 +355,21 @@ export function planDashboardSegments(
       },
     ];
   }
-  const total = parsePlan(plan).length;
-  const completed = new Set<number>();
-  for (const report of reports) {
-    if (report.n >= 1 && report.n <= total) completed.add(report.n);
-  }
-  const done = completed.size;
-  const nextIdx = firstUnreportedPlanStep(plan, reports);
+  const items = parsePlan(plan);
+  const completed = completedStepIds(reports, milestones);
+  const done = items.filter((item) => completed.has(item.id)).length;
+  const nextIdx = firstUnreportedPlanStep(plan, reports, milestones);
   const segments: WidgetSegment[] = [
     brand,
-    { text: `  ${done}/${total} `, color: "dim" },
+    { text: `  ${done}/${items.length} `, color: "dim" },
   ];
-  for (let i = 0; i < total; i++) {
-    if (completed.has(i + 1)) segments.push({ text: "✓", color: "success" });
+  for (let i = 0; i < items.length; i++) {
+    if (completed.has(items[i].id)) segments.push({ text: "✓", color: "success" });
     else if (i === nextIdx) segments.push({ text: "▶", color: "accent" });
     else segments.push({ text: "·", color: "dim" });
   }
   if (nextIdx >= 0) {
-    segments.push({ text: `  next: #${nextIdx + 1} `, color: "dim" });
+    segments.push({ text: `  next: ${items[nextIdx].id} `, color: "dim" });
     segments.push({ text: planItemLabel(plan, nextIdx) });
   } else {
     segments.push({ text: "  all done", color: "success" });
@@ -309,38 +377,36 @@ export function planDashboardSegments(
   return segments;
 }
 
-/** The mode indicator line (below the editor), pi-lens style. */
-export function modeSegments(enabled: boolean): WidgetSegment[] {
-  return enabled
-    ? [
-        { text: " strata", color: "accent" },
-        { text: "  on", color: "success" },
-      ]
-    : [
-        { text: " strata", color: "accent" },
-        { text: "  off", color: "dim" },
-      ];
+export function modeSegments(
+  enabled: boolean,
+  mode: "strict" | "light" = "strict",
+  paused = false,
+): WidgetSegment[] {
+  if (!enabled)
+    return [
+      { text: " strata", color: "accent" },
+      { text: "  off", color: "dim" },
+    ];
+  return [
+    { text: " strata", color: "accent" },
+    { text: paused ? "  paused" : `  ${mode}`, color: paused ? "dim" : "success" },
+  ];
 }
 
 // ---------------------------------------------------------------------------
-// TUI text fitting: widget lines must not wrap on narrow terminals
+// TUI text fitting
 // ---------------------------------------------------------------------------
 
 const SGR_RE = /\x1b\[[0-9;]*m/g;
 
-/** Terminal cell width of a string (ANSI SGR escapes excluded). */
 export function visibleWidth(s: string): number {
   return s.replace(SGR_RE, "").length;
 }
 
-/**
- * Truncate a (possibly colored) line to the terminal width, replacing the
- * tail with an ellipsis. ANSI escapes are kept intact and never counted.
- */
 export function fitLine(s: string, maxWidth: number): string {
   const w = Math.max(1, Math.floor(maxWidth));
   if (visibleWidth(s) <= w) return s;
-  const limit = w - 1; // room for the ellipsis
+  const limit = w - 1;
   let visible = 0;
   let out = "";
   for (let i = 0; i < s.length; i++) {
@@ -361,12 +427,11 @@ export function fitLine(s: string, maxWidth: number): string {
 }
 
 // ---------------------------------------------------------------------------
-// Session strata directory: raw context snapshots (tmp/) only
+// Session strata directory
 // ---------------------------------------------------------------------------
 
 export interface StrataPaths {
   dir: string;
-  /** Raw ephemeral context snapshots (disposable, outside the prefix). */
   tmp: string;
 }
 
@@ -378,15 +443,10 @@ export function ensureDir(dir: string): void {
   mkdirSync(dir, { recursive: true });
 }
 
-/** Write a raw ephemeral context snapshot (tmp layer, disposable). */
 export function writeSnapshot(path: string, title: string, body: string): void {
   ensureDir(dirname(path));
   const text = normalizeText(body);
-  writeFileSync(
-    path,
-    `# Raw context snapshot — ${title}\n${SEP}${text}\n`,
-    "utf8",
-  );
+  writeFileSync(path, `# Raw context snapshot — ${title}\n${SEP}${text}\n`, "utf8");
 }
 
 // ---------------------------------------------------------------------------
@@ -395,13 +455,6 @@ export function writeSnapshot(path: string, title: string, body: string): void {
 
 const STRATA_DIR_SUFFIX = ".pi_strata";
 
-/**
- * Remove orphaned strata directories: <name>.pi_strata whose sibling
- * <name>.jsonl session file no longer exists (the session was deleted).
- * pi fires no "session deleted" event, so orphans are collected lazily on
- * session start. Only entries inside `sessionsDir` are touched; anything
- * with a live session file is kept. Returns the number of dirs removed.
- */
 export function cleanupOrphanedStrataDirs(sessionsDir: string): number {
   let removed = 0;
   for (const entry of readdirSyncSafe(sessionsDir)) {

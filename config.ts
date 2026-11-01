@@ -36,21 +36,26 @@ export interface StrataConfig {
  autoContinue?: boolean;
  /** Hide STRATA marker anchors in the TUI transcript (display only). */
  hideAnchors?: boolean;
+ /** Token budget per compaction layer; 0 disables the budget. */
+ layerTokenBudget?: number;
 }
 
 export interface StrataSettings {
  autoContinue: boolean;
  hideAnchors: boolean;
+ layerTokenBudget: number;
 }
 
 export const STRATA_DEFAULTS: StrataSettings = {
  autoContinue: true,
  hideAnchors: true,
+ layerTokenBudget: 16384,
 };
 
 const ENV = {
  autoContinue: "PI_STRATA_AUTO_CONTINUE",
  hideAnchors: "PI_STRATA_HIDE_ANCHORS",
+ layerTokenBudget: "PI_STRATA_LAYER_TOKEN_BUDGET",
 } as const;
 
 type JsonScalar = number | string | boolean | null;
@@ -59,6 +64,18 @@ type JsonScalar = number | string | boolean | null;
 function envValue(name: string): string | undefined {
  const v = process.env[name];
  return v === undefined || v.trim() === "" ? undefined : v;
+}
+
+/** Parse a strict boolean env value, or undefined when invalid. */
+function envBoolean(name: string): boolean | undefined {
+ const value = envValue(name)?.trim().toLowerCase();
+ if (value === "1" || value === "true" || value === "on") {
+  return true;
+ }
+ if (value === "0" || value === "false" || value === "off") {
+  return false;
+ }
+ return undefined;
 }
 
 /**
@@ -93,15 +110,23 @@ export function readPiStrataConfig(
   if (typeof s.hideAnchors === "boolean") {
    merged.hideAnchors = s.hideAnchors;
   }
+  if (
+   typeof s.layerTokenBudget === "number" &&
+   Number.isFinite(s.layerTokenBudget) &&
+   Number.isInteger(s.layerTokenBudget) &&
+   s.layerTokenBudget >= 0
+  ) {
+   merged.layerTokenBudget = s.layerTokenBudget;
+  }
  }
  return merged;
 }
 
 /** Resolve the effective autoContinue: env > config > default. */
 function resolveAutoContinue(cfgAuto: boolean | undefined): boolean {
- const envAuto = envValue(ENV.autoContinue);
+ const envAuto = envBoolean(ENV.autoContinue);
  if (envAuto !== undefined) {
-  return envAuto !== "0"; // legacy: only "0" disables
+  return envAuto;
  }
  if (cfgAuto !== undefined) {
   return cfgAuto;
@@ -111,14 +136,29 @@ function resolveAutoContinue(cfgAuto: boolean | undefined): boolean {
 
 /** Resolve the effective hideAnchors: env > config > default. */
 function resolveHideAnchors(cfgHide: boolean | undefined): boolean {
- const envHide = envValue(ENV.hideAnchors);
+ const envHide = envBoolean(ENV.hideAnchors);
  if (envHide !== undefined) {
-  return envHide !== "0"; // only "0" disables
+  return envHide;
  }
  if (cfgHide !== undefined) {
   return cfgHide;
  }
  return STRATA_DEFAULTS.hideAnchors;
+}
+
+/** Resolve the effective layerTokenBudget: env > config > default. */
+function resolveLayerTokenBudget(cfgBudget: number | undefined): number {
+ const envBudget = envValue(ENV.layerTokenBudget)?.trim();
+ if (envBudget !== undefined && /^\d+$/.test(envBudget)) {
+  const value = Number(envBudget);
+  if (Number.isFinite(value) && Number.isInteger(value)) {
+   return value;
+  }
+ }
+ if (cfgBudget !== undefined) {
+  return cfgBudget;
+ }
+ return STRATA_DEFAULTS.layerTokenBudget;
 }
 
 /**
@@ -132,5 +172,6 @@ export function resolveStrataSettings(
  return {
   autoContinue: resolveAutoContinue(cfg.autoContinue),
   hideAnchors: resolveHideAnchors(cfg.hideAnchors),
+  layerTokenBudget: resolveLayerTokenBudget(cfg.layerTokenBudget),
  };
 }

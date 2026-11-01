@@ -6,16 +6,17 @@
  *
  *   [Layer 0] system prompt (+ static pi-strata instructions)
  *     [Layer 1] RESEARCH marker block (in the conversation)
- *       [Layer 2] PLAN marker block (the plan / TODO list)
- *         [Layer 3] STEP-N marker blocks (append-only step reports)
- *           [current] ephemeral task + tool outputs (discarded into reports)
+ *       [Layer 2] PLAN marker block (the base plan)
+ *         [Layer 3] MILESTONE and STEP-ID blocks (archived/current reports)
+ *           [Layer 4] PLAN-DELTA (the full effective plan)
+ *             [current] ephemeral task + tool outputs (discarded into reports)
  *
  * Layer data lives in the conversation, not in files: the model writes each
- * phase between STRATA:: markers, and layers 1–3 are injected as the
+ * phase between STRATA:: markers, and the layers are injected as the
  * deterministic compaction summary (the extracted blocks re-emitted in fixed
- * order), so after every phase compaction the prefix [system + layers] is
- * unchanged except for the replaced/appended blocks — the llama.cpp KV cache
- * survives.
+ * order). After every phase compaction the prefix [system + layers] is
+ * unchanged except for the replaced/appended blocks, enabling provider-side
+ * KV-cache reuse when the provider supports it.
  *
  * The session strata directory (next to the session file,
  * <session>.pi_strata/) holds raw context snapshots (tmp/) only.
@@ -41,14 +42,22 @@ import {
 } from "./compaction.ts";
 import {
   SEP,
+  STRATA_MARKER,
+  buildStrataSummary,
   cleanupOrphanedStrataDirs,
+  completedStepIds,
+  effectivePlan,
+  estimateTextTokens,
   extractLayers,
   fitLine,
   firstUnreportedPlanStep,
+  itemId,
   itemText,
   modeSegments,
   parsePlan,
+  planChangeError,
   planDashboardSegments,
+  planIdError,
   reportPlanCounts,
   strataPaths,
   stripStrataMarkersForDisplay,
@@ -85,35 +94,42 @@ function resolveStrataDir(ctx: ExtensionContext): string {
 }
 
 /** Static per-session instructions appended to the system prompt (layer 0). */
-export function buildStrataInstructions(strataDir: string): string {
+export function buildStrataInstructions(
+  strataDir: string,
+  mode: "strict" | "light" = "strict",
+): string {
   const p = strataPaths(strataDir);
+  const activation =
+    mode === "light"
+      ? "Light mode: answer questions and complete small tasks normally, without markers. Start the full pipeline below only when a task is substantial enough to benefit from phased context."
+      : "Strict mode: use the pipeline below for every implementation task. For questions, clarification, or discussion without a task, just answer without markers.";
   return `## PI-STRATA — layered context (KV-cache optimization)
 
-You work with a layered context so that llama.cpp can reuse the KV cache. The prompt prefix is immutable: [system] → [research] → [plan] → [step reports]. Ephemeral work (command output, current logs) is always appended at the very end of the prompt and compacted after every phase.
+You work with a layered context: [system] → [research] → [plan] → [milestones] → [step reports] → [plan delta]. Ephemeral work is appended at the end and a phase-boundary compaction is requested after every advance. Small sessions can remain temporarily uncompacted when the host pi does not support forced compaction; keep following the protocol.
 
-Phase data is not stored in files: you write each phase between markers directly in your message, and the extension extracts the blocks with a regex and builds the post-compaction prefix from them. The last occurrence of each block type wins: when updating a phase, write the FULL new version between new markers. A new RESEARCH or PLAN block starts a new task cycle: all STEP-N reports standing before it in the conversation are discarded automatically.
+${activation}
 
-Markers (write the tokens exactly; close every block with its END marker):
-- research:   /*STRATA::RESEARCH::v1*/ … /*STRATA::END::RESEARCH::v1*/
-- plan:       /*STRATA::PLAN::v1*/ … /*STRATA::END::PLAN::v1*/
-- step N report: /*STRATA::STEP-N::v1*/ … /*STRATA::END::STEP-N::v1*/
+Write each phase between exact markers. The last occurrence of a block wins. A new RESEARCH starts a new task cycle and clears the previous PLAN, PLAN-DELTA, STEP, and MILESTONE layers. Never rely on a previous cycle's reports.
 
-The pipeline only starts when the user gives a task. If they ask a question, clarify, or discuss something — just answer: no research and no plan are needed for that.
+Markers:
+- research: /*STRATA::RESEARCH::v1*/ … /*STRATA::END::RESEARCH::v1*/
+- base plan: /*STRATA::PLAN::v1*/ … /*STRATA::END::PLAN::v1*/
+- step ID report: /*STRATA::STEP-ID::v1*/ … /*STRATA::END::STEP-ID::v1*/
+- plan update: /*STRATA::PLAN-DELTA::v1*/ … /*STRATA::END::PLAN-DELTA::v1*/
 
 Pipeline:
-1. Clarify the requirements with the user until the task is fully pinned down.
-2. Pin the task: write the research report between the RESEARCH markers. Start it with a concise summary of the task as received from the user (their goal, requested outcome, and any explicit constraints), then record stack, architecture, inputs, constraints, and acceptance criteria.
-3. Plan: write an atomic TODO list between the PLAN markers, one action per line in the format "- action". Each plan item must be a self-contained instruction: after compaction the step is executed from its own item without re-reading the history, so record enough detail in it (which files/modules are touched, exactly what to do, verification commands, expected outcome) so the task can be completed relying only on the plan and the reports. Then call strata with action="advance" — the first compaction happens at the end of the turn.
-4. Execute steps one at a time. After each completed step (code + checks), write only the step N report between the STEP-N markers — 10-30 lines: what was done, which files changed, test/build results, key decisions, risks. Then call strata with action="advance" and step=N. The raw step context is saved to ${p.tmp}/step_N_raw.md during compaction — mention that in the report.
-5. After each step call strata with action="advance" and step=N (the number of the completed step) — compaction at the end of the turn.
-6. The reports are the primary information store for the following steps: do not omit key facts.
+1. Clarify the requirements until the task is pinned down.
+2. Write RESEARCH: begin with the user's goal, outcome, and explicit constraints; then record stack, architecture, inputs, and acceptance criteria.
+3. Write PLAN with one self-contained item per line in the format "- [id:S1] action". IDs are unique and stable (S1, S2, … or meaningful short IDs). Include files/modules, exact actions, verification commands, and expected outcomes. Call strata(action="advance") after writing a new RESEARCH and its new base PLAN.
+4. Execute one item at a time. After its code and checks, write a 10–30 line STEP-ID report: work done, files, verification results, decisions, and risks. Call strata(action="advance", step="ID"). The raw context is saved to ${p.tmp}/step_ID_raw.md when phase compaction succeeds; mention that path in the report.
+5. Reports and MILESTONE digests are the information store for later steps. Do not omit key facts.
 
 Rules:
-- The marker blocks in the summary after compaction are the current layer state: do not repeat them unchanged; write new blocks only when a phase is updated.
-- Keep the plan as written. Record completed work in the corresponding STEP-N report.
-- New task: when the user gives the next task after a plan is complete, start the cycle again — write a fresh RESEARCH report and a new PLAN; the previous task's step reports are dropped automatically, so the new cycle starts with a clean step history and you must not rely on the old step reports.
-- Unclosed marker blocks are dropped — close every block with its END marker before calling advance.
-- Do not hand-edit the summary after compaction — the extension generates it from the markers.`;
+- Do not re-emit PLAN to tick checkboxes. Progress comes from STEP and MILESTONE completion records.
+- To change the current plan, write PLAN-DELTA containing the FULL new effective plan with the same IDs for existing items. Completed item IDs and their action text are immutable. Add new work under fresh IDs.
+- A new RESEARCH must be followed by a new base PLAN before advance is accepted; a previous plan is not inherited.
+- Close every block before calling advance. Unclosed or empty blocks are dropped.
+- Do not hand-edit the generated summary after compaction.`;
 }
 
 /**
@@ -135,12 +151,15 @@ function branchHasContext(ctx: ExtensionContext): boolean {
  * byte-identical to buildStrataInstructions, so after the system prompt picks
  * the instructions up the model sees the same protocol it followed before).
  */
-export function buildStrataActivationMessage(strataDir: string): string {
+export function buildStrataActivationMessage(
+  strataDir: string,
+  mode: "strict" | "light",
+): string {
   return (
-    "[pi-strata] Layered-context mode is now ON for this session (enabled via /strata-on). " +
-    "The standing instructions below apply to every turn of this session; after the next " +
+    `[pi-strata] Layered-context ${mode} mode is now ON for this session. ` +
+    "The standing instructions below apply until /strata-off; after the next " +
     `compaction they move into the system prompt and this message is dropped.\n\n` +
-    buildStrataInstructions(strataDir)
+    buildStrataInstructions(strataDir, mode)
   );
 }
 
@@ -162,7 +181,11 @@ function branchText(ctx: ExtensionContext): string {
   const parts: string[] = [];
   if (cut >= 0) {
     const entry = branch[cut];
-    if (entry.type === "compaction" && typeof entry.summary === "string")
+    if (
+      entry.type === "compaction" &&
+      typeof entry.summary === "string" &&
+      entry.summary.startsWith(STRATA_MARKER)
+    )
       parts.push(entry.summary);
   }
   for (let i = cut + 1; i < branch.length; i++) {
@@ -192,78 +215,130 @@ function branchText(ctx: ExtensionContext): string {
 // ---------------------------------------------------------------------------
 
 function planAdvanceError(layers: StrataLayers): string | null {
-  if (!layers.plan)
-    return "Error: no PLAN block. Write the TODO list between /*STRATA::PLAN::v1*/ … /*STRATA::END::PLAN::v1*/ and call advance again.";
-  if (parsePlan(layers.plan).length === 0)
-    return 'Error: the PLAN block has no items (format "- action").';
-  return null;
+  if (!layers.research) return "Error: no RESEARCH block for the current cycle.";
+  if (!layers.plan || layers.planFresh === false)
+    return "Error: a new RESEARCH requires a new base PLAN. Write it between /*STRATA::PLAN::v1*/ … /*STRATA::END::PLAN::v1*/ and call advance again.";
+  const plan = effectivePlan(layers) as string;
+  if (parsePlan(plan).length === 0)
+    return 'Error: the effective PLAN has no items (format "- [id:S1] action").';
+  const idError = planIdError(plan);
+  return idError ? `Error: ${idError}` : null;
 }
 
-function stepAdvanceError(layers: StrataLayers, n: number): string | null {
-  const items = layers.plan ? parsePlan(layers.plan) : [];
+function lastCompactionSummary(ctx: ExtensionContext): string | undefined {
+  const branch = ctx.sessionManager.getBranch();
+  for (let i = branch.length - 1; i >= 0; i--) {
+    const entry = branch[i];
+    if (entry.type === "compaction" && typeof entry.summary === "string")
+      return entry.summary;
+  }
+  return undefined;
+}
+
+function droppedReports(
+  prev: StrataLayers | undefined,
+  next: StrataLayers,
+): { key: string; n?: number; text: string }[] {
+  const kept = new Set((next.reports ?? []).map((r) => `${r.key}\u0000${r.text}`));
+  return (prev?.reports ?? []).filter((r) => !kept.has(`${r.key}\u0000${r.text}`));
+}
+
+function layerChangeNotice(
+  prev: StrataLayers | undefined,
+  next: StrataLayers,
+): string {
+  const dropped = droppedReports(prev, next);
+  if (!dropped.length) return "";
+  return ` A new RESEARCH block started a new task cycle: the previous cycle's step reports [${dropped
+    .map((r) => r.key)
+    .join(",")}] are no longer in the layers.`;
+}
+
+function stepAdvanceError(layers: StrataLayers, key: string): string | null {
+  const plan = effectivePlan(layers);
+  const items = plan ? parsePlan(plan) : [];
   if (items.length === 0)
-    return "Error: no PLAN block. Write the TODO list between the PLAN markers and call advance again.";
-  if (n > items.length)
-    return `Error: the plan has ${items.length} item(s); there is no step ${n}.`;
-  if (
-    items
-      .slice(0, n - 1)
-      .some(
-        (_item, index) =>
-          !(layers.reports ?? []).some((report) => report.n === index + 1),
-      )
-  )
-    return `Error: complete the preceding plan items first: their STEP-N reports are missing.`;
-  if (!(layers.reports ?? []).some((r) => r.n === n))
-    return `Error: no report for step ${n}. Write it between /*STRATA::STEP-${n}::v1*/ … /*STRATA::END::STEP-${n}::v1*/ and call advance again.`;
+    return "Error: no effective PLAN. Write the plan and call advance again.";
+  const index = items.findIndex((item) => item.id === key);
+  if (index < 0) return `Error: there is no plan item with ID ${key}.`;
+  const completed = completedStepIds(layers.reports ?? [], layers.milestones ?? []);
+  if (items.slice(0, index).some((item) => !completed.has(item.id)))
+    return "Error: complete the preceding plan items first: their STEP reports are missing.";
+  if (!(layers.reports ?? []).some((r) => r.key === key))
+    return `Error: no report for step ${key}. Write it between /*STRATA::STEP-${key}::v1*/ … /*STRATA::END::STEP-${key}::v1*/ and call advance again.`;
   return null;
 }
 
-/**
- * advance — the model has just written the phase block(s); queue the
- * end-of-turn compaction. Validates the blocks against the conversation so a
- * forgotten marker fails fast with a fix-it message instead of compacting
- * the wrong prefix.
- */
 function actAdvance(
   rt: StrataRuntime,
   ctx: ExtensionContext,
-  step?: number,
+  step?: number | string,
 ): ToolResult {
   const layers = extractLayers(branchText(ctx));
   if (!layers)
     return toolText(
-      "Error: no STRATA:: blocks in the conversation. Write the phase between markers (RESEARCH/PLAN/STEP-N) and call advance again.",
+      "Error: no STRATA:: blocks in the conversation. Write RESEARCH/PLAN/STEP-ID blocks first.",
       true,
     );
+  const prev = extractLayers(lastCompactionSummary(ctx) ?? "");
+  const cycleChanged =
+    (prev?.research !== undefined && layers.research !== prev.research) ||
+    droppedReports(prev, layers).length > 0;
+  if (!cycleChanged) {
+    const changeError = planChangeError(prev, layers);
+    if (changeError) return toolText(`Error: ${changeError}`, true);
+  }
+  const notice = layerChangeNotice(prev, layers);
+  const plan = effectivePlan(layers);
+  const idError = plan ? planIdError(plan) : null;
+  if (idError) return toolText(`Error: ${idError}`, true);
 
   if (step === undefined) {
     const err = planAdvanceError(layers);
     if (err) return toolText(err, true);
-    const plan = layers.plan as string;
     rt.pending = { kind: "plan" };
-    return toolText(
-      `First compaction at the end of the turn. Next: execute step 1 ("${itemText(plan, 0)}"); after each step call strata(action="advance", step=N).`,
+    const nextIdx = firstUnreportedPlanStep(
+      plan as string,
+      layers.reports ?? [],
+      layers.milestones ?? [],
     );
+    const tail =
+      nextIdx >= 0
+        ? ` Next: execute ${itemId(plan as string, nextIdx)} ("${itemText(plan as string, nextIdx)}").`
+        : " All plan steps are complete.";
+    return toolText(`Plan compaction at the end of the turn.${notice}${tail}`);
   }
 
-  const n = Math.trunc(step);
-  if (!Number.isFinite(n) || n < 1)
-    return toolText("Error: step must be an integer >= 1.", true);
-  const err = stepAdvanceError(layers, n);
+  const items = plan ? parsePlan(plan) : [];
+  let key: string;
+  if (typeof step === "number") {
+    if (!Number.isInteger(step) || step < 1)
+      return toolText("Error: numeric step must be an integer >= 1.", true);
+    key = items[step - 1]?.id ?? String(step);
+  } else {
+    key = step.trim();
+    if (!/^[A-Za-z0-9][A-Za-z0-9_-]*$/.test(key))
+      return toolText("Error: step ID has an invalid format.", true);
+  }
+  const err = stepAdvanceError(layers, key);
   if (err) return toolText(err, true);
-  rt.pending = { kind: "step", stepN: n };
+  rt.pending = {
+    kind: "step",
+    stepId: key,
+    stepN: /^\d+$/.test(key) ? Number(key) : undefined,
+  };
   const tmpDir = rt.strataDir ? strataPaths(rt.strataDir).tmp : "(no session)";
   const nextIdx = firstUnreportedPlanStep(
-    layers.plan as string,
+    plan as string,
     layers.reports ?? [],
+    layers.milestones ?? [],
   );
   const tail =
     nextIdx >= 0
-      ? ` Next step: "${itemText(layers.plan as string, nextIdx)}".`
+      ? ` Next step: ${itemId(plan as string, nextIdx)} — "${itemText(plan as string, nextIdx)}".`
       : " All plan steps are complete.";
   return toolText(
-    `Step ${n} accepted. Compaction at the end of the turn (raw context → ${tmpDir}/step_${n}_raw.md).${tail}`,
+    `Step ${key} accepted. Compaction at the end of the turn (raw context → ${tmpDir}/step_${key}_raw.md).${notice}${tail}`,
   );
 }
 
@@ -277,28 +352,27 @@ export default function (pi: ExtensionAPI) {
   const rt: StrataRuntime = {
     strataDir: null,
     pending: null,
+    layerTokenBudget: initial.layerTokenBudget,
   };
-  // The strata mode is SESSION state, not a setting: off by default, enabled
-  // for the session with /strata-on. It is not persisted anywhere — a session
-  // (re)start or /reload begins with it off again. There is deliberately no
-  // in-session off command: off is the session default.
   let enabled = false;
-  // KV-cache guard: when /strata-on enables the mode in a session that
-  // already carries context, the system prompt must not change immediately
-  // (that would invalidate the whole cached prefix). The layer-0
-  // instructions are delivered as a message at the end of the context
-  // instead, and the system prompt picks them up only after the next
-  // compaction — which rewrites the context anyway (session_compact lifts
-  // the deferral). Fresh sessions take the immediate path (nothing to
-  // protect).
+  let strataMode: "strict" | "light" = "strict";
+  let paused = false;
   let deferSystemPrompt = false;
   let autoContinue = initial.autoContinue;
   let hideAnchors = initial.hideAnchors;
-  // Set by the session_before_compact handler: did the LAST before-compact
-  // event return a strata compaction result? Used by session_compact to
-  // detect when another extension's result replaced ours (pi keeps the
-  // result of the last-loaded handler — there is no merge).
   let compactOurs = false;
+  let deferredReason: string | undefined;
+  const stats = { compacted: 0, deferred: 0 };
+  rt.ensureBoundary = (ctx) => {
+    pi.appendEntry("strata-phase-boundary", {
+      kind: rt.pending?.kind,
+      stepId: rt.pending?.stepId,
+    });
+    const id = ctx.sessionManager.getLeafId();
+    if (!id) throw new Error("pi-strata: failed to append a phase boundary");
+    if (rt.pending) rt.pending.boundaryId = id;
+    return id;
+  };
 
   // Compact TUI rendering for the standing-instructions message
   // (INSTRUCTIONS_CUSTOM_TYPE): one line by default, expandable to the full
@@ -334,35 +408,50 @@ export default function (pi: ExtensionAPI) {
   const statusText = (ctx: ExtensionContext): string => {
     const dir = rt.strataDir ?? "(no session)";
     const layers = extractLayers(branchText(ctx));
-    const plan = layers?.plan;
+    const plan = layers ? effectivePlan(layers) : undefined;
     const reports = layers?.reports ?? [];
+    const milestones = layers?.milestones ?? [];
     const counts = plan
-      ? reportPlanCounts(plan, reports)
+      ? reportPlanCounts(plan, reports, milestones)
       : { done: 0, total: 0 };
-    const nextIdx = plan ? firstUnreportedPlanStep(plan, reports) : -1;
+    const nextIdx = plan
+      ? firstUnreportedPlanStep(plan, reports, milestones)
+      : -1;
     let next = "no plan";
     if (counts.total > 0) {
       next =
         nextIdx >= 0
-          ? `next: #${nextIdx + 1} ${itemText(plan as string, nextIdx)}`
+          ? `next: ${itemId(plan as string, nextIdx)} ${itemText(plan as string, nextIdx)}`
           : "all done";
     }
-    const reportNumbers = reports.map((r) => r.n);
-    let pending = "none";
-    if (rt.pending)
-      pending =
-        rt.pending.kind === "step"
-          ? `step:${rt.pending.stepN}`
-          : rt.pending.kind;
+    let cacheRead = "n/a";
+    for (const entry of [...ctx.sessionManager.getBranch()].reverse()) {
+      if (entry.type !== "message") continue;
+      const message = entry.message as {
+        role?: string;
+        usage?: { input?: number; cacheRead?: number };
+      };
+      if (message.role === "assistant" && message.usage) {
+        cacheRead = `${message.usage.cacheRead ?? 0}/${message.usage.input ?? 0}`;
+        break;
+      }
+    }
+    const layerTokens = layers
+      ? estimateTextTokens(buildStrataSummary(layers))
+      : 0;
+    const epoch = Math.max(0, ...milestones.map((m) => m.n));
     return [
       `dir: ${dir}`,
-      `enabled: ${enabled ? "on" : "off"}`,
-      `sysprompt: ${deferSystemPrompt ? "deferred (next compaction)" : "active"}`,
+      `mode: ${enabled ? strataMode : "off"}${paused ? " (paused)" : ""}`,
+      `sysprompt: ${!enabled ? "inactive" : deferSystemPrompt ? "deferred (next compaction)" : "active"}`,
       `research: ${layers?.research ? "yes" : "no"}`,
       `plan: ${counts.done}/${counts.total} (${next})`,
-      `reports: [${reportNumbers.join(",")}]`,
+      `reports: [${reports.map((r) => r.key).join(",")}]`,
+      `layers: ~${layerTokens}/${rt.layerTokenBudget} tokens; epoch=${epoch}`,
+      `cacheRead/input: ${cacheRead}`,
+      `compactions: ok=${stats.compacted} deferred=${stats.deferred}${deferredReason ? ` (${deferredReason})` : ""}`,
       `settings: auto=${autoContinue ? "on" : "off"} anchors=${hideAnchors ? "hidden" : "shown"}`,
-      `pending: ${pending}`,
+      `pending: ${rt.pending ? `${rt.pending.kind}:${rt.pending.stepId ?? ""}` : "none"}`,
     ].join(" | ");
   };
 
@@ -387,38 +476,32 @@ export default function (pi: ExtensionAPI) {
   const updateWidget = (ctx: ExtensionContext): void => {
     if (!ctx.hasUI) return;
     const layers = extractLayers(branchText(ctx));
-    // The plan dashboard (above the editor) is a strata-session feature:
-    // hidden while the mode is off (and for non-strata sessions, as before).
-    // One line, e.g.:  strata  2/5 ✓✓▶··  next: #3 install deps
     const dashboard =
       enabled && layers
         ? planDashboardSegments(
-            layers.plan,
+            effectivePlan(layers),
             layers.reports ?? [],
             layers.research !== undefined,
+            layers.milestones ?? [],
           )
         : undefined;
     if (dashboard) {
       ctx.ui.setWidget("strata", (_tui, theme) => ({
         render: (width) => renderSegments(dashboard, theme, width),
-        invalidate: () => {}, // stateless: render recomputes from captured segments
+        invalidate: () => {},
       }));
     } else {
       ctx.ui.setWidget("strata", undefined);
     }
-    // Mode indicator (below the editor, pi-lens style): redundant while the
-    // dashboard is visible — it already shows the strata state. Shown only
-    // while the dashboard is hidden, so the session default (off) or an
-    // explicit /strata-on is never a surprise.
     if (dashboard) {
       ctx.ui.setWidget("strata-mode", undefined);
     } else {
-      const segments = modeSegments(enabled);
+      const segments = modeSegments(enabled, strataMode, paused);
       ctx.ui.setWidget(
         "strata-mode",
         (_tui, theme) => ({
           render: (width) => renderSegments(segments, theme, width),
-          invalidate: () => {}, // stateless: render recomputes from captured segments
+          invalidate: () => {},
         }),
         { placement: "belowEditor" },
       );
@@ -426,12 +509,15 @@ export default function (pi: ExtensionAPI) {
   };
 
   const autoContinueNext = (ctx: ExtensionContext): void => {
+    if (paused) return;
     try {
-      const plan = extractLayers(branchText(ctx))?.plan;
-      if (!plan) return;
+      const layers = extractLayers(branchText(ctx));
+      const plan = layers ? effectivePlan(layers) : undefined;
+      if (!layers || !plan) return;
       const idx = firstUnreportedPlanStep(
         plan,
-        extractLayers(branchText(ctx))?.reports ?? [],
+        layers.reports ?? [],
+        layers.milestones ?? [],
       );
       if (idx === -1) {
         if (ctx.hasUI)
@@ -439,10 +525,10 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       pi.sendUserMessage(
-        `PI-STRATA: continue — execute step ${idx + 1}: "${itemText(plan, idx)}".`,
+        `PI-STRATA: continue — execute ${itemId(plan, idx)}: "${itemText(plan, idx)}".`,
       );
     } catch {
-      // non-fatal: user can continue manually
+      // The user can continue manually if the host rejects a queued message.
     }
   };
 
@@ -450,29 +536,33 @@ export default function (pi: ExtensionAPI) {
     ctx: ExtensionContext,
     customInstructions: string,
     onDone?: () => void,
+    continueOnError = false,
   ): void => {
     if (ctx.hasUI)
       ctx.ui.notify(`pi-strata: compacting… (${customInstructions})`, "info");
     ctx.compact({
       customInstructions,
       onComplete: () => {
+        deferredReason = undefined;
         if (ctx.hasUI) ctx.ui.notify("pi-strata: compaction finished", "info");
         onDone?.();
       },
       onError: (err) => {
-        // Pi rejects a manual compaction before invoking
-        // `session_before_compact` when the whole branch fits inside its
-        // `compaction.keepRecentTokens` budget. Do not leave a phase request
-        // pending in that case: a stale pending marker would be consumed by
-        // the next unrelated compaction and mislabel it as a step/plan dump.
         rt.pending = null;
+        if (continueOnError && err.message !== "Compaction cancelled") {
+          deferredReason = err.message;
+          stats.deferred += 1;
+          if (ctx.hasUI)
+            ctx.ui.notify(
+              `pi-strata: compaction deferred (${err.message}); continuing with the full phase in context. It will be retried at the next advance.`,
+              "warning",
+            );
+          updateWidget(ctx);
+          onDone?.();
+          return;
+        }
         if (ctx.hasUI)
-          ctx.ui.notify(
-            err.message === "Nothing to compact (session too small)"
-              ? "pi-strata: Pi deferred compaction: the session fits in compaction.keepRecentTokens. The phase remains in context; the compaction will be retried at the next advance."
-              : `pi-strata: compaction failed: ${err.message}`,
-            "error",
-          );
+          ctx.ui.notify(`pi-strata: compaction failed: ${err.message}`, "error");
       },
     });
   };
@@ -484,13 +574,19 @@ export default function (pi: ExtensionAPI) {
     // The mode is session state: every (re)started session begins off; the
     // user opts in with /strata-on (nothing is persisted).
     enabled = false;
+    strataMode = "strict";
+    paused = false;
     deferSystemPrompt = false;
     autoContinue = s.autoContinue;
     hideAnchors = s.hideAnchors;
 
     rt.strataDir = resolveStrataDir(ctx);
     rt.pending = null;
+    rt.layerTokenBudget = s.layerTokenBudget;
     compactOurs = false;
+    deferredReason = undefined;
+    stats.compacted = 0;
+    stats.deferred = 0;
 
     // pi fires no "session deleted" event: collect orphaned strata dirs of
     // sessions whose .jsonl is gone (session picker or manual deletion).
@@ -533,7 +629,7 @@ export default function (pi: ExtensionAPI) {
       // whole cached prefix and make the model re-read the session.
       return;
     }
-    const instructions = buildStrataInstructions(rt.strataDir);
+    const instructions = buildStrataInstructions(rt.strataDir, strataMode);
     return { systemPrompt: `${event.systemPrompt}\n\n${instructions}` };
   });
 
@@ -561,17 +657,22 @@ export default function (pi: ExtensionAPI) {
       rt.pending = null;
       return;
     }
-    // Do not consume `pending` here. `ctx.compact()` starts asynchronously and
-    // `session_before_compact` needs this marker to build a plan/step summary
-    // (and to save the correct raw snapshot). It consumes the marker only
-    // after Pi has prepared a real compaction.
-    if (pending.kind === "step") {
-      requestCompact(ctx, `step:${pending.stepN}`, () => {
-        if (autoContinue) autoContinueNext(ctx);
-      });
-    } else {
-      requestCompact(ctx, "plan");
+    try {
+      if (!pending.boundaryId) rt.ensureBoundary?.(ctx);
+    } catch (err) {
+      rt.pending = null;
+      if (ctx.hasUI)
+        ctx.ui.notify(
+          `pi-strata: could not create a phase boundary: ${err instanceof Error ? err.message : String(err)}`,
+          "error",
+        );
+      return;
     }
+    const continueNext = () => {
+      if (autoContinue) autoContinueNext(ctx);
+    };
+    const label = pending.kind === "step" ? `step:${pending.stepId}` : "plan";
+    requestCompact(ctx, label, continueNext, true);
   });
 
   // The plan/reports live in the conversation, so every finished turn (and
@@ -594,13 +695,21 @@ export default function (pi: ExtensionAPI) {
           "info",
         );
     }
-    if (!ctx.hasUI) return;
     const details = event.compactionEntry.details as StrataDetails | undefined;
+    if (details?.strata) {
+      stats.compacted += 1;
+      deferredReason = undefined;
+    }
+    if (!ctx.hasUI) return;
     if (details?.strata) {
       ctx.ui.notify(
         `pi-strata: layers compacted (${details.strata.mode}${
-          details.strata.llmSummary ? ", + pi summary" : ""
-        })`,
+          details.strata.llmSummary
+            ? ", + pi summary"
+            : details.strata.rawFallback
+              ? ", + raw fallback"
+              : ""
+        }${details.strata.epoch ? `, epoch ${details.strata.epoch}` : ""})`,
         "info",
       );
     } else if (compactOurs) {
@@ -623,9 +732,9 @@ export default function (pi: ExtensionAPI) {
   const StrataParams = Type.Object({
     action: StringEnum(["advance", "status"] as const),
     step: Type.Optional(
-      Type.Number({
+      Type.Union([Type.String(), Type.Number()], {
         description:
-          "action=advance: number of the completed step (N from the STEP-N marker). Omit for the first compaction after the plan.",
+          'action=advance: completed plan item ID (for example "S1"). Legacy numeric positions are also accepted. Omit after a base PLAN or PLAN-DELTA.',
       }),
     ),
   });
@@ -657,28 +766,36 @@ export default function (pi: ExtensionAPI) {
 
   pi.registerCommand("strata", {
     description:
-      "pi-strata: layer status; /strata compact — forced compaction; /strata reset — delete raw snapshots (tmp/); /strata-on — enable the mode for this session",
+      "pi-strata: status/stats; compact; pause/resume auto-continue; reset snapshots; /strata-on [strict|light]; /strata-off",
     handler: async (args, ctx) => {
       const cmd = (args ?? "").trim().toLowerCase();
-
       if (cmd === "compact") {
         await ctx.waitForIdle();
         requestCompact(ctx, "manual");
         return;
       }
-
+      if (cmd === "pause" || cmd === "resume") {
+        if (!enabled) {
+          ctx.ui.notify("pi-strata: enable the mode with /strata-on first", "error");
+          return;
+        }
+        paused = cmd === "pause";
+        updateWidget(ctx);
+        ctx.ui.notify(`pi-strata: auto-continue ${paused ? "paused" : "resumed"}`, "info");
+        if (!paused) {
+          await ctx.waitForIdle();
+          autoContinueNext(ctx);
+        }
+        return;
+      }
       if (cmd !== "reset") {
         ctx.ui.notify(`pi-strata: ${statusText(ctx)}`, "info");
         updateWidget(ctx);
         return;
       }
-
       if (!ctx.hasUI || !rt.strataDir) {
         if (ctx.hasUI)
-          ctx.ui.notify(
-            "pi-strata: reset is only available in interactive mode",
-            "error",
-          );
+          ctx.ui.notify("pi-strata: reset requires a session and interactive mode", "error");
         return;
       }
       const ok = await ctx.ui.confirm(
@@ -691,32 +808,25 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // /strata-on — enable the strata mode for THIS session only. Session-
-  // scoped by design: off by default, nothing is persisted (a session
-  // (re)start or /reload begins off again). Once on: the layer-0 instructions
-  // are appended to the system prompt and strata compaction is intercepted.
-  // There is deliberately no in-session off command — off is the default.
   pi.registerCommand("strata-on", {
-    description:
-      "pi-strata: enable layered-context mode for this session (off by default; not persisted)",
-    // async: pi's command handler type is Promise<void> even though the
-    // work below is synchronous.
-    handler: async (_args, ctx) => {
+    description: "pi-strata: enable strict (default) or light mode for this session",
+    handler: async (args, ctx) => {
       if (enabled) {
-        if (ctx.hasUI) ctx.ui.notify("pi-strata: already on", "info");
+        if (ctx.hasUI) ctx.ui.notify(`pi-strata: already on (${strataMode})`, "info");
         return;
       }
+      const requested = (args ?? "").trim().toLowerCase() || "strict";
+      if (requested !== "strict" && requested !== "light") {
+        if (ctx.hasUI)
+          ctx.ui.notify("pi-strata: usage: /strata-on [strict|light]", "error");
+        return;
+      }
+      strataMode = requested;
       if (!rt.strataDir) rt.strataDir = resolveStrataDir(ctx);
       enabled = true;
-      rt.pending = null; // a stale phase request must not outlive the switch
-      // KV-cache guard: in a session that already carries context, changing
-      // the system prompt now would invalidate the whole cached prefix and
-      // make the local model re-read the entire session. Deliver the layer-0
-      // instructions as a standing message appended at the end of the
-      // context instead; the next compaction rewrites the context anyway, so
-      // the system prompt picks them up then (session_compact lifts the
-      // deferral). A fresh session takes the immediate path (nothing to
-      // protect).
+      paused = false;
+      deferredReason = undefined;
+      rt.pending = null;
       deferSystemPrompt = branchHasContext(ctx);
       updateWidget(ctx);
       const layers = extractLayers(branchText(ctx));
@@ -725,31 +835,45 @@ export default function (pi: ExtensionAPI) {
         pi.sendMessage(
           {
             customType: INSTRUCTIONS_CUSTOM_TYPE,
-            content: buildStrataActivationMessage(rt.strataDir),
+            content: buildStrataActivationMessage(rt.strataDir, strataMode),
             display: true,
           },
           { deliverAs: "nextTurn" },
         );
-        // Resumed/forked strata sessions re-announce the layer state, as
-        // before; plain sessions get the generic notice only.
-        if (ctx.hasUI)
-          ctx.ui.notify(
-            `pi-strata: enabled — standing instructions queued at the end of the context; the system prompt picks them up after the next compaction (KV cache preserved).${hasLayers ? ` ${statusText(ctx)}` : ""}`,
-            "info",
-          );
-        return;
       }
-      if (!ctx.hasUI) return;
-      if (hasLayers) {
-        // Session already carries strata layers (resumed/forked): re-announce
-        // the current state instead of a generic notice.
-        ctx.ui.notify(`pi-strata: ${statusText(ctx)}`, "info");
-      } else {
+      if (ctx.hasUI)
         ctx.ui.notify(
-          "pi-strata: enabled — layer-0 instructions and strata compaction are on for this session",
+          `pi-strata: ${strataMode} mode enabled${deferSystemPrompt ? " — standing instructions queued; the system prompt changes after the next compaction" : ""}.${hasLayers ? ` ${statusText(ctx)}` : ""}`,
           "info",
         );
+    },
+  });
+
+  pi.registerCommand("strata-off", {
+    description: "pi-strata: disable layered-context mode for this session",
+    handler: async (_args, ctx) => {
+      if (!enabled) {
+        if (ctx.hasUI) ctx.ui.notify("pi-strata: already off", "info");
+        return;
       }
+      const hadContext = branchHasContext(ctx);
+      enabled = false;
+      paused = false;
+      deferSystemPrompt = false;
+      deferredReason = undefined;
+      rt.pending = null;
+      if (hadContext)
+        pi.sendMessage(
+          {
+            customType: INSTRUCTIONS_CUSTOM_TYPE,
+            content:
+              "[pi-strata] Layered-context mode is now OFF. Previous standing pi-strata instructions are revoked; do not emit new STRATA blocks or call advance unless the user explicitly enables the mode again.",
+            display: true,
+          },
+          { deliverAs: "nextTurn" },
+        );
+      updateWidget(ctx);
+      if (ctx.hasUI) ctx.ui.notify("pi-strata: disabled for this session", "info");
     },
   });
 }

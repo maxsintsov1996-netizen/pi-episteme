@@ -31,6 +31,7 @@
     "compaction.ts",
     "config.ts",
     "check.cjs",
+    "local-check.cjs",
     "README.md",
     "README.ru.md",
     "SPEC.md",
@@ -38,6 +39,7 @@
   ],
   "scripts": {
     "test": "node check.cjs",
+    "test:local": "node local-check.cjs",
     "typecheck": "tsc --noEmit"
   },
   "peerDependencies": {
