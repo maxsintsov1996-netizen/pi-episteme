@@ -1,10 +1,10 @@
 /**
- * pi-strata — layered KV-cache-friendly context management for pi-coding-agent
+ * pi-episteme — layered KV-cache-friendly context management for pi-coding-agent
  * with local LLMs (llama.cpp / Ollama). See SPEC.md.
  *
  * Context layout (prompt prefix must be byte-stable across steps):
  *
- *   [Layer 0] system prompt (+ static pi-strata instructions)
+ *   [Layer 0] system prompt (+ static pi-episteme instructions)
  *     [Layer 1] RESEARCH marker block (in the conversation)
  *       [Layer 2] PLAN marker block (the base plan)
  *         [Layer 3] MILESTONE and STEP-ID blocks (archived/current reports)
@@ -12,18 +12,21 @@
  *             [current] ephemeral task + tool outputs (discarded into reports)
  *
  * Layer data lives in the conversation, not in files: the model writes each
- * phase between STRATA:: markers, and the layers are injected as the
+ * phase between EPISTEME:: markers, and the layers are injected as the
  * deterministic compaction summary (the extracted blocks re-emitted in fixed
  * order). After every phase compaction the prefix [system + layers] is
  * unchanged except for the replaced/appended blocks, enabling provider-side
  * KV-cache reuse when the provider supports it.
  *
- * The session strata directory (next to the session file,
- * <session>.pi_strata/) holds raw context snapshots (tmp/) only.
+ * The session episteme directory (next to the session file,
+ * <session>.pi_episteme/) holds raw context snapshots (tmp/) only.
  */
 
 import {
+  createAgentSession,
+  DefaultResourceLoader,
   getAgentDir,
+  SessionManager,
   sessionEntryToContextMessages,
   type ExtensionAPI,
   type ExtensionContext,
@@ -34,17 +37,22 @@ import { Box, Text } from "@earendil-works/pi-tui";
 import { rmSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { Type } from "typebox";
-import { resolveStrataSettings } from "./config.ts";
+import { resolveEpistemeSettings } from "./config.ts";
 import {
   handleSessionBeforeCompact,
-  type StrataDetails,
-  type StrataRuntime,
+  type EpistemeDetails,
+  type EpistemeRuntime,
 } from "./compaction.ts";
 import {
+  readOrchFixRounds,
+  runOrchestration,
+  type OrchestrationOutcome,
+} from "./orchestrator.ts";
+import {
   SEP,
-  STRATA_MARKER,
-  buildStrataSummary,
-  cleanupOrphanedStrataDirs,
+  EPISTEME_MARKER,
+  buildEpistemeSummary,
+  cleanupOrphanedEpistemeDirs,
   completedStepIds,
   effectivePlan,
   estimateTextTokens,
@@ -59,24 +67,36 @@ import {
   planDashboardSegments,
   planIdError,
   reportPlanCounts,
-  strataPaths,
-  stripStrataMarkersForDisplay,
-  type StrataLayers,
+  epistemePaths,
+  stripEpistemeMarkersForDisplay,
+  type EpistemeLayers,
   type WidgetSegment,
-} from "./strata.ts";
+} from "./episteme.ts";
 
 /**
- * customType of the standing-instructions message injected by /strata-on in
+ * customType of the standing-instructions message injected by /episteme-on in
  * a session that already carries context (KV-cache guard: the system prompt
  * must not change mid-session, so the layer-0 instructions ride on a message
  * appended at the end of the context until the next compaction).
  */
-const INSTRUCTIONS_CUSTOM_TYPE = "strata-instructions";
+const INSTRUCTIONS_CUSTOM_TYPE = "episteme-instructions";
 
 interface ToolResult {
   content: { type: "text"; text: string }[];
   details: Record<string, never>;
   isError?: boolean;
+}
+
+/** Render the orchestration result for the tool result / the TUI. */
+function formatOrchestrationOutcome(outcome: OrchestrationOutcome): string {
+  const lines = [
+    `Orchestration ${outcome.ok ? "PASSED" : "FAILED"}: ${outcome.summary}`,
+    `completed steps: [${outcome.completed.join(",")}]`,
+  ];
+  if (outcome.rounds > 0) lines.push(`corrective rounds: ${outcome.rounds}`);
+  if (outcome.issues.length > 0)
+    lines.push(`open issues:\n${outcome.issues.map((i) => `- ${i}`).join("\n")}`);
+  return lines.join("\n");
 }
 
 const toolText = (text: string, isError = false): ToolResult => ({
@@ -85,25 +105,25 @@ const toolText = (text: string, isError = false): ToolResult => ({
   isError,
 });
 
-/** Session-scoped strata directory: next to the session file. */
-function resolveStrataDir(ctx: ExtensionContext): string {
+/** Session-scoped episteme directory: next to the session file. */
+function resolveEpistemeDir(ctx: ExtensionContext): string {
   const sm = ctx.sessionManager;
   const file = sm.getSessionFile();
-  if (file) return join(dirname(file), `${basename(file, ".jsonl")}.pi_strata`);
-  return join(getAgentDir(), "strata", sm.getSessionId());
+  if (file) return join(dirname(file), `${basename(file, ".jsonl")}.pi_episteme`);
+  return join(getAgentDir(), "episteme", sm.getSessionId());
 }
 
 /** Static per-session instructions appended to the system prompt (layer 0). */
-export function buildStrataInstructions(
-  strataDir: string,
-  mode: "strict" | "light" = "strict",
+export function buildEpistemeInstructions(
+  epistemeDir: string,
+  mode: "strict" | "light" = "light",
 ): string {
-  const p = strataPaths(strataDir);
+  const p = epistemePaths(epistemeDir);
   const activation =
     mode === "light"
       ? "Light mode: answer questions and complete small tasks normally, without markers. Start the full pipeline below only when a task is substantial enough to benefit from phased context."
       : "Strict mode: use the pipeline below for every implementation task. For questions, clarification, or discussion without a task, just answer without markers.";
-  return `## PI-STRATA — layered context (KV-cache optimization)
+  return `## PI-EPISTEME — layered context (KV-cache optimization)
 
 You work with a layered context: [system] → [research] → [plan] → [milestones] → [step reports] → [plan delta]. Ephemeral work is appended at the end and a phase-boundary compaction is requested after every advance. Small sessions can remain temporarily uncompacted when the host pi does not support forced compaction; keep following the protocol.
 
@@ -112,16 +132,16 @@ ${activation}
 Write each phase between exact markers. The last occurrence of a block wins. A new RESEARCH starts a new task cycle and clears the previous PLAN, PLAN-DELTA, STEP, and MILESTONE layers. Never rely on a previous cycle's reports.
 
 Markers:
-- research: /*STRATA::RESEARCH::v1*/ … /*STRATA::END::RESEARCH::v1*/
-- base plan: /*STRATA::PLAN::v1*/ … /*STRATA::END::PLAN::v1*/
-- step ID report: /*STRATA::STEP-ID::v1*/ … /*STRATA::END::STEP-ID::v1*/
-- plan update: /*STRATA::PLAN-DELTA::v1*/ … /*STRATA::END::PLAN-DELTA::v1*/
+- research: /*EPISTEME::RESEARCH::v1*/ … /*EPISTEME::END::RESEARCH::v1*/
+- base plan: /*EPISTEME::PLAN::v1*/ … /*EPISTEME::END::PLAN::v1*/
+- step ID report: /*EPISTEME::STEP-ID::v1*/ … /*EPISTEME::END::STEP-ID::v1*/
+- plan update: /*EPISTEME::PLAN-DELTA::v1*/ … /*EPISTEME::END::PLAN-DELTA::v1*/
 
 Pipeline:
 1. Clarify the requirements until the task is pinned down.
 2. Write RESEARCH: begin with the user's goal, outcome, and explicit constraints; then record stack, architecture, inputs, and acceptance criteria.
-3. Write PLAN with one self-contained item per line in the format "- [id:S1] action". IDs are unique and stable (S1, S2, … or meaningful short IDs). Include files/modules, exact actions, verification commands, and expected outcomes. Call strata(action="advance") after writing a new RESEARCH and its new base PLAN.
-4. Execute one item at a time. After its code and checks, write a 10–30 line STEP-ID report: work done, files, verification results, decisions, and risks. Call strata(action="advance", step="ID"). The raw context is saved to ${p.tmp}/step_ID_raw.md when phase compaction succeeds; mention that path in the report.
+3. Write PLAN with one self-contained item per line in the format "- [id:S1] action". IDs are unique and stable (S1, S2, … or meaningful short IDs). Include files/modules, exact actions, verification commands, and expected outcomes. Call episteme(action="advance") after writing a new RESEARCH and its new base PLAN.
+4. Execute one item at a time. After its code and checks, write a 10–30 line STEP-ID report: work done, files, verification results, decisions, and risks. Call episteme(action="advance", step="ID"). The raw context is saved to ${p.tmp}/step_ID_raw.md when phase compaction succeeds; mention that path in the report.
 5. Reports and MILESTONE digests are the information store for later steps. Do not omit key facts.
 
 Rules:
@@ -146,20 +166,20 @@ function branchHasContext(ctx: ExtensionContext): boolean {
 }
 
 /**
- * The standing instructions delivered by /strata-on in a session that already
+ * The standing instructions delivered by /episteme-on in a session that already
  * has context: a short activation notice plus the exact layer-0 body (kept
- * byte-identical to buildStrataInstructions, so after the system prompt picks
+ * byte-identical to buildEpistemeInstructions, so after the system prompt picks
  * the instructions up the model sees the same protocol it followed before).
  */
-export function buildStrataActivationMessage(
-  strataDir: string,
+export function buildEpistemeActivationMessage(
+  epistemeDir: string,
   mode: "strict" | "light",
 ): string {
   return (
-    `[pi-strata] Layered-context ${mode} mode is now ON for this session. ` +
-    "The standing instructions below apply until /strata-off; after the next " +
+    `[pi-episteme] Layered-context ${mode} mode is now ON for this session. ` +
+    "The standing instructions below apply until /episteme-off; after the next " +
     `compaction they move into the system prompt and this message is dropped.\n\n` +
-    buildStrataInstructions(strataDir, mode)
+    buildEpistemeInstructions(epistemeDir, mode)
   );
 }
 
@@ -184,7 +204,7 @@ function branchText(ctx: ExtensionContext): string {
     if (
       entry.type === "compaction" &&
       typeof entry.summary === "string" &&
-      entry.summary.startsWith(STRATA_MARKER)
+      entry.summary.startsWith(EPISTEME_MARKER)
     )
       parts.push(entry.summary);
   }
@@ -214,10 +234,10 @@ function branchText(ctx: ExtensionContext): string {
 // Tool actions
 // ---------------------------------------------------------------------------
 
-function planAdvanceError(layers: StrataLayers): string | null {
+function planAdvanceError(layers: EpistemeLayers): string | null {
   if (!layers.research) return "Error: no RESEARCH block for the current cycle.";
   if (!layers.plan || layers.planFresh === false)
-    return "Error: a new RESEARCH requires a new base PLAN. Write it between /*STRATA::PLAN::v1*/ … /*STRATA::END::PLAN::v1*/ and call advance again.";
+    return "Error: a new RESEARCH requires a new base PLAN. Write it between /*EPISTEME::PLAN::v1*/ … /*EPISTEME::END::PLAN::v1*/ and call advance again.";
   const plan = effectivePlan(layers) as string;
   if (parsePlan(plan).length === 0)
     return 'Error: the effective PLAN has no items (format "- [id:S1] action").';
@@ -236,16 +256,16 @@ function lastCompactionSummary(ctx: ExtensionContext): string | undefined {
 }
 
 function droppedReports(
-  prev: StrataLayers | undefined,
-  next: StrataLayers,
+  prev: EpistemeLayers | undefined,
+  next: EpistemeLayers,
 ): { key: string; n?: number; text: string }[] {
   const kept = new Set((next.reports ?? []).map((r) => `${r.key}\u0000${r.text}`));
   return (prev?.reports ?? []).filter((r) => !kept.has(`${r.key}\u0000${r.text}`));
 }
 
 function layerChangeNotice(
-  prev: StrataLayers | undefined,
-  next: StrataLayers,
+  prev: EpistemeLayers | undefined,
+  next: EpistemeLayers,
 ): string {
   const dropped = droppedReports(prev, next);
   if (!dropped.length) return "";
@@ -254,7 +274,7 @@ function layerChangeNotice(
     .join(",")}] are no longer in the layers.`;
 }
 
-function stepAdvanceError(layers: StrataLayers, key: string): string | null {
+function stepAdvanceError(layers: EpistemeLayers, key: string): string | null {
   const plan = effectivePlan(layers);
   const items = plan ? parsePlan(plan) : [];
   if (items.length === 0)
@@ -265,19 +285,19 @@ function stepAdvanceError(layers: StrataLayers, key: string): string | null {
   if (items.slice(0, index).some((item) => !completed.has(item.id)))
     return "Error: complete the preceding plan items first: their STEP reports are missing.";
   if (!(layers.reports ?? []).some((r) => r.key === key))
-    return `Error: no report for step ${key}. Write it between /*STRATA::STEP-${key}::v1*/ … /*STRATA::END::STEP-${key}::v1*/ and call advance again.`;
+    return `Error: no report for step ${key}. Write it between /*EPISTEME::STEP-${key}::v1*/ … /*EPISTEME::END::STEP-${key}::v1*/ and call advance again.`;
   return null;
 }
 
 function actAdvance(
-  rt: StrataRuntime,
+  rt: EpistemeRuntime,
   ctx: ExtensionContext,
   step?: number | string,
 ): ToolResult {
   const layers = extractLayers(branchText(ctx));
   if (!layers)
     return toolText(
-      "Error: no STRATA:: blocks in the conversation. Write RESEARCH/PLAN/STEP-ID blocks first.",
+      "Error: no EPISTEME:: blocks in the conversation. Write RESEARCH/PLAN/STEP-ID blocks first.",
       true,
     );
   const prev = extractLayers(lastCompactionSummary(ctx) ?? "");
@@ -327,7 +347,7 @@ function actAdvance(
     stepId: key,
     stepN: /^\d+$/.test(key) ? Number(key) : undefined,
   };
-  const tmpDir = rt.strataDir ? strataPaths(rt.strataDir).tmp : "(no session)";
+  const tmpDir = rt.epistemeDir ? epistemePaths(rt.epistemeDir).tmp : "(no session)";
   const nextIdx = firstUnreportedPlanStep(
     plan as string,
     layers.reports ?? [],
@@ -345,17 +365,17 @@ function actAdvance(
 // ---------------------------------------------------------------------------
 
 export default function (pi: ExtensionAPI) {
-  // Config: env (PI_STRATA_*) > settings.json `piStrata` > defaults.
+  // Config: env (PI_EPISTEME_*) > settings.json `piEpisteme` > defaults.
   // Resolved at load time from process.cwd(); re-resolved on session_start
   // with the real project cwd.
-  const initial = resolveStrataSettings(process.cwd());
-  const rt: StrataRuntime = {
-    strataDir: null,
+  const initial = resolveEpistemeSettings(process.cwd());
+  const rt: EpistemeRuntime = {
+    epistemeDir: null,
     pending: null,
     layerTokenBudget: initial.layerTokenBudget,
   };
   let enabled = false;
-  let strataMode: "strict" | "light" = "strict";
+  let epistemeMode: "strict" | "light" = "light";
   let paused = false;
   let deferSystemPrompt = false;
   let autoContinue = initial.autoContinue;
@@ -363,13 +383,14 @@ export default function (pi: ExtensionAPI) {
   let compactOurs = false;
   let deferredReason: string | undefined;
   const stats = { compacted: 0, deferred: 0 };
+  let orchestrationActive = false;
   rt.ensureBoundary = (ctx) => {
-    pi.appendEntry("strata-phase-boundary", {
+    pi.appendEntry("episteme-phase-boundary", {
       kind: rt.pending?.kind,
       stepId: rt.pending?.stepId,
     });
     const id = ctx.sessionManager.getLeafId();
-    if (!id) throw new Error("pi-strata: failed to append a phase boundary");
+    if (!id) throw new Error("pi-episteme: failed to append a phase boundary");
     if (rt.pending) rt.pending.boundaryId = id;
     return id;
   };
@@ -383,7 +404,7 @@ export default function (pi: ExtensionAPI) {
       const line =
         expanded && typeof message.content === "string"
           ? message.content
-          : `${theme.fg("accent", "strata")} ${theme.fg(
+          : `${theme.fg("accent", "episteme")} ${theme.fg(
               "dim",
               "standing instructions attached (move to the system prompt after the next compaction)",
             )}`;
@@ -393,7 +414,7 @@ export default function (pi: ExtensionAPI) {
     },
   );
 
-  // Display-only: hide the STRATA marker anchors in the TUI transcript
+  // Display-only: hide the EPISTEME marker anchors in the TUI transcript
   // (config hideAnchors, default on; re-resolved on session_start). pi's
   // markdown transformer runs before rendering (assistant text and
   // thinking, streaming and final, new and restored messages); the session
@@ -401,12 +422,12 @@ export default function (pi: ExtensionAPI) {
   // unaffected. User messages are passed through untouched.
   pi.registerMarkdownTransformer((markdown, { messageType }) =>
     hideAnchors && messageType !== "user"
-      ? stripStrataMarkersForDisplay(markdown)
+      ? stripEpistemeMarkersForDisplay(markdown)
       : markdown,
   );
 
   const statusText = (ctx: ExtensionContext): string => {
-    const dir = rt.strataDir ?? "(no session)";
+    const dir = rt.epistemeDir ?? "(no session)";
     const layers = extractLayers(branchText(ctx));
     const plan = layers ? effectivePlan(layers) : undefined;
     const reports = layers?.reports ?? [];
@@ -437,12 +458,12 @@ export default function (pi: ExtensionAPI) {
       }
     }
     const layerTokens = layers
-      ? estimateTextTokens(buildStrataSummary(layers))
+      ? estimateTextTokens(buildEpistemeSummary(layers))
       : 0;
     const epoch = Math.max(0, ...milestones.map((m) => m.n));
     return [
       `dir: ${dir}`,
-      `mode: ${enabled ? strataMode : "off"}${paused ? " (paused)" : ""}`,
+      `mode: ${enabled ? epistemeMode : "off"}${paused ? " (paused)" : ""}`,
       `sysprompt: ${!enabled ? "inactive" : deferSystemPrompt ? "deferred (next compaction)" : "active"}`,
       `research: ${layers?.research ? "yes" : "no"}`,
       `plan: ${counts.done}/${counts.total} (${next})`,
@@ -471,7 +492,7 @@ export default function (pi: ExtensionAPI) {
     return [fitLine(segments.map(paint).join(""), width)];
   };
 
-  // Keeps both strata widgets in sync (call this whenever the conversation
+  // Keeps both episteme widgets in sync (call this whenever the conversation
   // or the mode can have changed).
   const updateWidget = (ctx: ExtensionContext): void => {
     if (!ctx.hasUI) return;
@@ -486,19 +507,19 @@ export default function (pi: ExtensionAPI) {
           )
         : undefined;
     if (dashboard) {
-      ctx.ui.setWidget("strata", (_tui, theme) => ({
+      ctx.ui.setWidget("episteme", (_tui, theme) => ({
         render: (width) => renderSegments(dashboard, theme, width),
         invalidate: () => {},
       }));
     } else {
-      ctx.ui.setWidget("strata", undefined);
+      ctx.ui.setWidget("episteme", undefined);
     }
     if (dashboard) {
-      ctx.ui.setWidget("strata-mode", undefined);
+      ctx.ui.setWidget("episteme-mode", undefined);
     } else {
-      const segments = modeSegments(enabled, strataMode, paused);
+      const segments = modeSegments(enabled, epistemeMode, paused);
       ctx.ui.setWidget(
-        "strata-mode",
+        "episteme-mode",
         (_tui, theme) => ({
           render: (width) => renderSegments(segments, theme, width),
           invalidate: () => {},
@@ -521,11 +542,11 @@ export default function (pi: ExtensionAPI) {
       );
       if (idx === -1) {
         if (ctx.hasUI)
-          ctx.ui.notify("pi-strata: all plan steps completed", "info");
+          ctx.ui.notify("pi-episteme: all plan steps completed", "info");
         return;
       }
       pi.sendUserMessage(
-        `PI-STRATA: continue — execute ${itemId(plan, idx)}: "${itemText(plan, idx)}".`,
+        `PI-EPISTEME: continue — execute ${itemId(plan, idx)}: "${itemText(plan, idx)}".`,
       );
     } catch {
       // The user can continue manually if the host rejects a queued message.
@@ -539,12 +560,12 @@ export default function (pi: ExtensionAPI) {
     continueOnError = false,
   ): void => {
     if (ctx.hasUI)
-      ctx.ui.notify(`pi-strata: compacting… (${customInstructions})`, "info");
+      ctx.ui.notify(`pi-episteme: compacting… (${customInstructions})`, "info");
     ctx.compact({
       customInstructions,
       onComplete: () => {
         deferredReason = undefined;
-        if (ctx.hasUI) ctx.ui.notify("pi-strata: compaction finished", "info");
+        if (ctx.hasUI) ctx.ui.notify("pi-episteme: compaction finished", "info");
         onDone?.();
       },
       onError: (err) => {
@@ -554,7 +575,7 @@ export default function (pi: ExtensionAPI) {
           stats.deferred += 1;
           if (ctx.hasUI)
             ctx.ui.notify(
-              `pi-strata: compaction deferred (${err.message}); continuing with the full phase in context. It will be retried at the next advance.`,
+              `pi-episteme: compaction deferred (${err.message}); continuing with the full phase in context. It will be retried at the next advance.`,
               "warning",
             );
           updateWidget(ctx);
@@ -562,25 +583,146 @@ export default function (pi: ExtensionAPI) {
           return;
         }
         if (ctx.hasUI)
-          ctx.ui.notify(`pi-strata: compaction failed: ${err.message}`, "error");
+          ctx.ui.notify(`pi-episteme: compaction failed: ${err.message}`, "error");
       },
     });
+  };
+
+  const orchestrateTask = async (
+    task: string,
+    ctx: ExtensionContext,
+    toolSignal?: AbortSignal,
+  ): Promise<ToolResult> => {
+    if (orchestrationActive)
+      return toolText("Error: an orchestration is already running.", true);
+    const model = ctx.model;
+    if (!model) return toolText("Error: no model selected.", true);
+    orchestrationActive = true;
+    const notify = (phase: string): void => {
+      if (ctx.hasUI)
+        ctx.ui.notify(`pi-episteme orchestration: ${phase}`, "info");
+    };
+    try {
+      const outcome = await runOrchestration(
+        task,
+        {
+          // Chat-only round (Manager planning/fixes): one provider call with
+          // the byte-stable prefix as the system prompt (see context.ts).
+          callModel: async (call, signal) => {
+            const message = await ctx.modelRegistry.complete(
+              model,
+              {
+                systemPrompt: call.systemPrompt,
+                messages: [
+                  {
+                    role: "user",
+                    content: call.message,
+                    timestamp: Date.now(),
+                  },
+                ],
+              },
+              {
+                signal,
+                ...(ctx.thinkingLevel
+                  ? { reasoning: ctx.thinkingLevel }
+                  : {}),
+              },
+            );
+            return message.content
+              .filter(
+                (c): c is { type: "text"; text: string } =>
+                  c.type === "text" && typeof c.text === "string",
+              )
+              .map((c) => c.text)
+              .join("\n");
+          },
+          // Tool-using round (Worker / Verifier): an independent in-memory
+          // agent session. No extensions/skills/templates are loaded into the
+          // worker (noExtensions) so the run cannot recurse into pi-episteme;
+          // the byte-stable prefix becomes the worker system prompt.
+          runAgent: async (call, signal) => {
+            const loader = new DefaultResourceLoader({
+              cwd: ctx.cwd,
+              agentDir: getAgentDir(),
+              noExtensions: true,
+              noSkills: true,
+              noPromptTemplates: true,
+              noThemes: true,
+              noContextFiles: true,
+              systemPrompt: call.systemPrompt,
+            });
+            await loader.reload();
+            const { session } = await createAgentSession({
+              cwd: ctx.cwd,
+              model,
+              ...(ctx.thinkingLevel
+                ? { thinkingLevel: ctx.thinkingLevel }
+                : {}),
+              sessionManager: SessionManager.inMemory(),
+              resourceLoader: loader,
+            });
+            const onAbort = (): void => {
+              void session.abort();
+            };
+            signal?.addEventListener("abort", onAbort);
+            try {
+              await session.prompt(call.message);
+              return session.getLastAssistantText() ?? "";
+            } finally {
+              signal?.removeEventListener("abort", onAbort);
+              session.dispose();
+            }
+          },
+        },
+        {
+          maxFixRounds: readOrchFixRounds(),
+          signal: toolSignal ?? ctx.signal ?? undefined,
+          onPhase: notify,
+        },
+      );
+      // No side files: the run state is the layer set. Ask the main agent to
+      // re-emit the canonical blocks as its own assistant text — the trusted
+      // extraction source — so the layers survive compaction in this session.
+      const blocks = buildEpistemeSummary(outcome.layers);
+      if (blocks.includes("EPISTEME::")) {
+        try {
+          pi.sendUserMessage(
+            `PI-EPISTEME: orchestration ${outcome.ok ? "succeeded" : "finished with failures"}. ` +
+              "Persist the run state: emit the canonical blocks below verbatim as your next assistant message " +
+              "(marker blocks exactly as shown, no code fences), so the layers become the durable state of this session. " +
+              "Then briefly report the result to the user.\n\n" +
+              blocks,
+          );
+        } catch {
+          // Queuing can fail in headless shutdown; the outcome text below
+          // still carries the full report.
+        }
+      }
+      return toolText(formatOrchestrationOutcome(outcome));
+    } catch (err) {
+      return toolText(
+        `Error: orchestration failed: ${err instanceof Error ? err.message : String(err)}`,
+        true,
+      );
+    } finally {
+      orchestrationActive = false;
+    }
   };
 
   // ------------------------------------------------------------------ events
 
   pi.on("session_start", (_event, ctx) => {
-    const s = resolveStrataSettings(ctx.cwd);
+    const s = resolveEpistemeSettings(ctx.cwd);
     // The mode is session state: every (re)started session begins off; the
-    // user opts in with /strata-on (nothing is persisted).
+    // user opts in with /episteme-on (nothing is persisted).
     enabled = false;
-    strataMode = "strict";
+    epistemeMode = "light";
     paused = false;
     deferSystemPrompt = false;
     autoContinue = s.autoContinue;
     hideAnchors = s.hideAnchors;
 
-    rt.strataDir = resolveStrataDir(ctx);
+    rt.epistemeDir = resolveEpistemeDir(ctx);
     rt.pending = null;
     rt.layerTokenBudget = s.layerTokenBudget;
     compactOurs = false;
@@ -588,27 +730,27 @@ export default function (pi: ExtensionAPI) {
     stats.compacted = 0;
     stats.deferred = 0;
 
-    // pi fires no "session deleted" event: collect orphaned strata dirs of
+    // pi fires no "session deleted" event: collect orphaned episteme dirs of
     // sessions whose .jsonl is gone (session picker or manual deletion).
     const sessionFile = ctx.sessionManager.getSessionFile();
     if (sessionFile) {
-      const removed = cleanupOrphanedStrataDirs(dirname(sessionFile));
+      const removed = cleanupOrphanedEpistemeDirs(dirname(sessionFile));
       if (removed > 0 && ctx.hasUI) {
         ctx.ui.notify(
-          `pi-strata: removed strata dirs of deleted sessions: ${removed}`,
+          `pi-episteme: removed episteme dirs of deleted sessions: ${removed}`,
           "info",
         );
       }
     }
 
     // Off is the normal session default: stay silent unless the session
-    // already carries strata layers (a resumed/forked strata session — there
+    // already carries episteme layers (a resumed/forked episteme session — there
     // are no files to rehydrate, the layers live in the conversation) — then
-    // point at /strata-on and announce the layer state.
+    // point at /episteme-on and announce the layer state.
     const layers = extractLayers(branchText(ctx));
     if (ctx.hasUI && layers && (layers.research || layers.plan)) {
       ctx.ui.notify(
-        `pi-strata: strata layers found in the session, mode is off (session default) — /strata-on re-enables the pipeline. ${statusText(ctx)}`,
+        `pi-episteme: episteme layers found in the session, mode is off (session default) — /episteme-on re-enables the pipeline. ${statusText(ctx)}`,
         "info",
       );
     }
@@ -618,9 +760,9 @@ export default function (pi: ExtensionAPI) {
   pi.on("before_agent_start", (event, ctx) => {
     // `/reload` replaces the extension runtime without replaying
     // `session_start` for the already open session. Rehydrate the only
-    // session-scoped value lazily so the next turn still receives strata
+    // session-scoped value lazily so the next turn still receives episteme
     // instructions and can intercept compaction.
-    if (!rt.strataDir) rt.strataDir = resolveStrataDir(ctx);
+    if (!rt.epistemeDir) rt.epistemeDir = resolveEpistemeDir(ctx);
     if (!enabled) return; // disabled: no layer-0 instructions this turn
     if (deferSystemPrompt) {
       // KV-cache guard: the standing instructions ride on the injected
@@ -629,14 +771,14 @@ export default function (pi: ExtensionAPI) {
       // whole cached prefix and make the model re-read the session.
       return;
     }
-    const instructions = buildStrataInstructions(rt.strataDir, strataMode);
+    const instructions = buildEpistemeInstructions(rt.epistemeDir, epistemeMode);
     return { systemPrompt: `${event.systemPrompt}\n\n${instructions}` };
   });
 
   pi.on("session_before_compact", async (event, ctx) => {
     // Compaction can also be the first event after `/reload` (for example an
     // automatic overflow compaction), before another agent turn has started.
-    if (!rt.strataDir) rt.strataDir = resolveStrataDir(ctx);
+    if (!rt.epistemeDir) rt.epistemeDir = resolveEpistemeDir(ctx);
     if (!enabled) {
       // Disabled: fall back to pi's default compaction. Drop any stale
       // phase request so it cannot be consumed by a later compaction.
@@ -649,11 +791,11 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("agent_settled", (_event, ctx) => {
-    if (!rt.strataDir) rt.strataDir = resolveStrataDir(ctx);
+    if (!rt.epistemeDir) rt.epistemeDir = resolveEpistemeDir(ctx);
     const pending = rt.pending;
     if (!pending) return;
     if (!enabled) {
-      // Disabled mid-phase: drop the request, no strata compaction.
+      // Disabled mid-phase: drop the request, no episteme compaction.
       rt.pending = null;
       return;
     }
@@ -663,7 +805,7 @@ export default function (pi: ExtensionAPI) {
       rt.pending = null;
       if (ctx.hasUI)
         ctx.ui.notify(
-          `pi-strata: could not create a phase boundary: ${err instanceof Error ? err.message : String(err)}`,
+          `pi-episteme: could not create a phase boundary: ${err instanceof Error ? err.message : String(err)}`,
           "error",
         );
       return;
@@ -691,37 +833,37 @@ export default function (pi: ExtensionAPI) {
       deferSystemPrompt = false;
       if (ctx.hasUI)
         ctx.ui.notify(
-          "pi-strata: layer-0 instructions moved to the system prompt",
+          "pi-episteme: layer-0 instructions moved to the system prompt",
           "info",
         );
     }
-    const details = event.compactionEntry.details as StrataDetails | undefined;
-    if (details?.strata) {
+    const details = event.compactionEntry.details as EpistemeDetails | undefined;
+    if (details?.episteme) {
       stats.compacted += 1;
       deferredReason = undefined;
     }
     if (!ctx.hasUI) return;
-    if (details?.strata) {
+    if (details?.episteme) {
       ctx.ui.notify(
-        `pi-strata: layers compacted (${details.strata.mode}${
-          details.strata.llmSummary
+        `pi-episteme: layers compacted (${details.episteme.mode}${
+          details.episteme.llmSummary
             ? ", + pi summary"
-            : details.strata.rawFallback
+            : details.episteme.rawFallback
               ? ", + raw fallback"
               : ""
-        }${details.strata.epoch ? `, epoch ${details.strata.epoch}` : ""})`,
+        }${details.episteme.epoch ? `, epoch ${details.episteme.epoch}` : ""})`,
         "info",
       );
     } else if (compactOurs) {
-      // We returned a strata result but the saved entry does not carry our
-      // details.strata marker: another extension's session_before_compact
-      // handler (loaded after pi-strata) replaced it — or, when pi's default
+      // We returned a episteme result but the saved entry does not carry our
+      // details.episteme marker: another extension's session_before_compact
+      // handler (loaded after pi-episteme) replaced it — or, when pi's default
       // ran, our result was dropped. Either way the layers are not preserved.
       const cause = event.fromExtension
-        ? "another extension's session_before_compact handler (loaded after pi-strata) replaced it"
+        ? "another extension's session_before_compact handler (loaded after pi-episteme) replaced it"
         : "pi's default summarization ran instead";
       ctx.ui.notify(
-        `pi-strata: the strata summary was not used (${cause}); the strata layers are not preserved in this summary. If several extensions handle compaction, keep only one or load pi-strata last.`,
+        `pi-episteme: the episteme summary was not used (${cause}); the episteme layers are not preserved in this summary. If several extensions handle compaction, keep only one or load pi-episteme last.`,
         "warning",
       );
     }
@@ -729,44 +871,78 @@ export default function (pi: ExtensionAPI) {
 
   // -------------------------------------------------------------------- tool
 
-  const StrataParams = Type.Object({
-    action: StringEnum(["advance", "status"] as const),
+  const EpistemeParams = Type.Object({
+    action: StringEnum(["advance", "status", "orchestrate"] as const),
     step: Type.Optional(
       Type.Union([Type.String(), Type.Number()], {
         description:
           'action=advance: completed plan item ID (for example "S1"). Legacy numeric positions are also accepted. Omit after a base PLAN or PLAN-DELTA.',
       }),
     ),
+    task: Type.Optional(
+      Type.String({
+        description:
+          'action=orchestrate: the full task for the GVS-style pipeline (Manager → Workers → Verifier). The pipeline runs file-less: its state lives in the Episteme layers.',
+      }),
+    ),
   });
 
   pi.registerTool({
-    name: "strata",
-    label: "Strata",
+    name: "episteme",
+    label: "Episteme",
     description:
-      'pi-strata: advances the layered-context phases (KV-cache). After writing a phase between STRATA:: markers, call strata(action="advance") — compaction at the end of the turn; with step=N — after completed step N. status — current layer state.',
-    parameters: StrataParams,
-    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      'pi-episteme: advances the layered-context phases (KV-cache). After writing a phase between EPISTEME:: markers, call episteme(action="advance") — compaction at the end of the turn; with step=N — after completed step N. status — current layer state. orchestrate — run the file-less Manager → Worker → Verifier pipeline for a complex task (param: task).',
+    parameters: EpistemeParams,
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       switch (params.action) {
         case "advance":
           if (!enabled)
             return toolText(
-              "Error: pi-strata is disabled. Run /strata-on to enable it for this session, then call advance again.",
+              "Error: pi-episteme is disabled. Run /episteme-on to enable it for this session, then call advance again.",
               true,
             );
           return actAdvance(rt, ctx, params.step);
         case "status":
           return toolText(statusText(ctx));
+        case "orchestrate": {
+          const task = (params.task ?? "").trim();
+          if (!task)
+            return toolText(
+              'Error: action=orchestrate requires the task parameter (the full task description).',
+              true,
+            );
+          return orchestrateTask(task, ctx, signal);
+        }
         default:
-          return toolText("Error: unknown strata action.", true);
+          return toolText("Error: unknown episteme action.", true);
       }
     },
   });
 
   // ----------------------------------------------------------------- command
 
-  pi.registerCommand("strata", {
+  pi.registerCommand("episteme-orchestrate", {
     description:
-      "pi-strata: status/stats; compact; pause/resume auto-continue; reset snapshots; /strata-on [strict|light]; /strata-off",
+      "pi-episteme: run the file-less GVS-style pipeline (Manager → Workers → Verifier) for a complex task",
+    handler: async (args, ctx) => {
+      const task = (args ?? "").trim();
+      if (!task) {
+        ctx.ui.notify(
+          "pi-episteme: usage: /episteme-orchestrate <task description>",
+          "error",
+        );
+        return;
+      }
+      await ctx.waitForIdle();
+      const result = await orchestrateTask(task, ctx);
+      const text = result.content.map((c) => c.text).join("\n");
+      ctx.ui.notify(`pi-episteme: ${text}`, result.isError ? "error" : "info");
+    },
+  });
+
+  pi.registerCommand("episteme", {
+    description:
+      "pi-episteme: status/stats; compact; pause/resume auto-continue; reset snapshots; /episteme-on [strict|light]; /episteme-off",
     handler: async (args, ctx) => {
       const cmd = (args ?? "").trim().toLowerCase();
       if (cmd === "compact") {
@@ -776,12 +952,12 @@ export default function (pi: ExtensionAPI) {
       }
       if (cmd === "pause" || cmd === "resume") {
         if (!enabled) {
-          ctx.ui.notify("pi-strata: enable the mode with /strata-on first", "error");
+          ctx.ui.notify("pi-episteme: enable the mode with /episteme-on first", "error");
           return;
         }
         paused = cmd === "pause";
         updateWidget(ctx);
-        ctx.ui.notify(`pi-strata: auto-continue ${paused ? "paused" : "resumed"}`, "info");
+        ctx.ui.notify(`pi-episteme: auto-continue ${paused ? "paused" : "resumed"}`, "info");
         if (!paused) {
           await ctx.waitForIdle();
           autoContinueNext(ctx);
@@ -789,40 +965,67 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       if (cmd !== "reset") {
-        ctx.ui.notify(`pi-strata: ${statusText(ctx)}`, "info");
+        ctx.ui.notify(`pi-episteme: ${statusText(ctx)}`, "info");
         updateWidget(ctx);
         return;
       }
-      if (!ctx.hasUI || !rt.strataDir) {
+      if (!ctx.hasUI || !rt.epistemeDir) {
         if (ctx.hasUI)
-          ctx.ui.notify("pi-strata: reset requires a session and interactive mode", "error");
+          ctx.ui.notify("pi-episteme: reset requires a session and interactive mode", "error");
         return;
       }
       const ok = await ctx.ui.confirm(
-        "pi-strata",
+        "pi-episteme",
         "Delete the raw context snapshots of this session (tmp/)?",
       );
       if (!ok) return;
-      rmSync(strataPaths(rt.strataDir).tmp, { recursive: true, force: true });
-      ctx.ui.notify("pi-strata: snapshots cleared", "info");
+      rmSync(epistemePaths(rt.epistemeDir).tmp, { recursive: true, force: true });
+      ctx.ui.notify("pi-episteme: snapshots cleared", "info");
     },
   });
 
-  pi.registerCommand("strata-on", {
-    description: "pi-strata: enable strict (default) or light mode for this session",
+  pi.registerCommand("episteme-on", {
+    description: "pi-episteme: enable light (default) or strict mode for this session",
     handler: async (args, ctx) => {
-      if (enabled) {
-        if (ctx.hasUI) ctx.ui.notify(`pi-strata: already on (${strataMode})`, "info");
-        return;
-      }
-      const requested = (args ?? "").trim().toLowerCase() || "strict";
+      const requested = (args ?? "").trim().toLowerCase() || "light";
       if (requested !== "strict" && requested !== "light") {
         if (ctx.hasUI)
-          ctx.ui.notify("pi-strata: usage: /strata-on [strict|light]", "error");
+          ctx.ui.notify("pi-episteme: usage: /episteme-on [strict|light]", "error");
         return;
       }
-      strataMode = requested;
-      if (!rt.strataDir) rt.strataDir = resolveStrataDir(ctx);
+      if (enabled) {
+        if (requested === epistemeMode) {
+          if (ctx.hasUI) ctx.ui.notify(`pi-episteme: already on (${epistemeMode})`, "info");
+          return;
+        }
+        // Switch mode without a full off/on cycle. With the instructions in
+        // the system prompt the next turn picks the new mode up automatically
+        // (the same cache-invalidation cost as /episteme-off); while they
+        // ride on the injected message, supersede them in place.
+        const previous = epistemeMode;
+        epistemeMode = requested;
+        if (!rt.epistemeDir) rt.epistemeDir = resolveEpistemeDir(ctx);
+        if (deferSystemPrompt) {
+          pi.sendMessage(
+            {
+              customType: INSTRUCTIONS_CUSTOM_TYPE,
+              content:
+                `[pi-episteme] Mode switched: ${previous} → ${epistemeMode}. ` +
+                "The standing instructions below supersede the earlier activation; " +
+                "the previous set no longer applies.\n\n" +
+                buildEpistemeActivationMessage(rt.epistemeDir, epistemeMode),
+              display: true,
+            },
+            { deliverAs: "nextTurn" },
+          );
+        }
+        updateWidget(ctx);
+        if (ctx.hasUI)
+          ctx.ui.notify(`pi-episteme: switched to ${epistemeMode} mode`, "info");
+        return;
+      }
+      epistemeMode = requested;
+      if (!rt.epistemeDir) rt.epistemeDir = resolveEpistemeDir(ctx);
       enabled = true;
       paused = false;
       deferredReason = undefined;
@@ -835,7 +1038,7 @@ export default function (pi: ExtensionAPI) {
         pi.sendMessage(
           {
             customType: INSTRUCTIONS_CUSTOM_TYPE,
-            content: buildStrataActivationMessage(rt.strataDir, strataMode),
+            content: buildEpistemeActivationMessage(rt.epistemeDir, epistemeMode),
             display: true,
           },
           { deliverAs: "nextTurn" },
@@ -843,17 +1046,17 @@ export default function (pi: ExtensionAPI) {
       }
       if (ctx.hasUI)
         ctx.ui.notify(
-          `pi-strata: ${strataMode} mode enabled${deferSystemPrompt ? " — standing instructions queued; the system prompt changes after the next compaction" : ""}.${hasLayers ? ` ${statusText(ctx)}` : ""}`,
+          `pi-episteme: ${epistemeMode} mode enabled${deferSystemPrompt ? " — standing instructions queued; the system prompt changes after the next compaction" : ""}.${hasLayers ? ` ${statusText(ctx)}` : ""}`,
           "info",
         );
     },
   });
 
-  pi.registerCommand("strata-off", {
-    description: "pi-strata: disable layered-context mode for this session",
+  pi.registerCommand("episteme-off", {
+    description: "pi-episteme: disable layered-context mode for this session",
     handler: async (_args, ctx) => {
       if (!enabled) {
-        if (ctx.hasUI) ctx.ui.notify("pi-strata: already off", "info");
+        if (ctx.hasUI) ctx.ui.notify("pi-episteme: already off", "info");
         return;
       }
       const hadContext = branchHasContext(ctx);
@@ -867,13 +1070,13 @@ export default function (pi: ExtensionAPI) {
           {
             customType: INSTRUCTIONS_CUSTOM_TYPE,
             content:
-              "[pi-strata] Layered-context mode is now OFF. Previous standing pi-strata instructions are revoked; do not emit new STRATA blocks or call advance unless the user explicitly enables the mode again.",
+              "[pi-episteme] Layered-context mode is now OFF. Previous standing pi-episteme instructions are revoked; do not emit new EPISTEME blocks or call advance unless the user explicitly enables the mode again.",
             display: true,
           },
           { deliverAs: "nextTurn" },
         );
       updateWidget(ctx);
-      if (ctx.hasUI) ctx.ui.notify("pi-strata: disabled for this session", "info");
+      if (ctx.hasUI) ctx.ui.notify("pi-episteme: disabled for this session", "info");
     },
   });
 }

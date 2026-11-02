@@ -1,4 +1,4 @@
-// pi-strata — core strata logic.
+// pi-episteme — core episteme logic.
 //
 // Phase data lives in the conversation. The model writes marker blocks and
 // the extension folds them into a deterministic summary. New plans use stable
@@ -21,8 +21,8 @@ import {
 } from "node:fs";
 import { dirname, join } from "node:path";
 
-export const STRATA_VERSION = "v1";
-export const STRATA_MARKER = `## PI-STRATA CONTEXT (${STRATA_VERSION})`;
+export const EPISTEME_VERSION = "v1";
+export const EPISTEME_MARKER = `## PI-EPISTEME CONTEXT (${EPISTEME_VERSION})`;
 export const SEP = "\n\n";
 
 export function normalizeText(s: string): string {
@@ -41,28 +41,28 @@ export function estimateTextTokens(s: string): number {
 // Marker blocks
 // ---------------------------------------------------------------------------
 
-export interface StrataBlock {
+export interface EpistemeBlock {
   key: string;
   stepN?: number;
   milestoneN?: number;
   text: string;
 }
 
-export function strataBlock(key: string, body: string): string {
-  return `/*STRATA::${key}::v1*/\n${normalizeText(body)}\n/*STRATA::END::${key}::v1*/`;
+export function epistemeBlock(key: string, body: string): string {
+  return `/*EPISTEME::${key}::v1*/\n${normalizeText(body)}\n/*EPISTEME::END::${key}::v1*/`;
 }
 
 const BLOCK_SOURCE =
-  /\/\*STRATA::(RESEARCH|PLAN-DELTA|PLAN|MILESTONE-(\d+)|STEP-([A-Za-z0-9][A-Za-z0-9_-]*))::v1\*\/([\s\S]*?)\/\*STRATA::END::\1::v1\*\//g;
+  /\/\*EPISTEME::(RESEARCH|PLAN-DELTA|PLAN|MILESTONE-(\d+)|STEP-([A-Za-z0-9][A-Za-z0-9_-]*))::v1\*\/([\s\S]*?)\/\*EPISTEME::END::\1::v1\*\//g;
 
-export function extractStrataBlocks(text: string): StrataBlock[] {
+export function extractEpistemeBlocks(text: string): EpistemeBlock[] {
   const re = new RegExp(BLOCK_SOURCE.source, "g");
-  const blocks: StrataBlock[] = [];
+  const blocks: EpistemeBlock[] = [];
   for (let m = re.exec(text); m !== null; m = re.exec(text)) {
     const key = m[1];
     const body = normalizeText(m[4]);
     if (body.length === 0) continue;
-    if (body.includes(`/*STRATA::${key}::v1*/`)) continue;
+    if (body.includes(`/*EPISTEME::${key}::v1*/`)) continue;
     const rawStep = m[3];
     const stepN =
       rawStep && /^\d+$/.test(rawStep) && Number.isSafeInteger(Number(rawStep))
@@ -78,7 +78,7 @@ export function extractStrataBlocks(text: string): StrataBlock[] {
   return blocks;
 }
 
-export function stripStrataBlocks(text: string): string {
+export function stripEpistemeBlocks(text: string): string {
   return normalizeText(text.replace(new RegExp(BLOCK_SOURCE.source, "g"), ""));
 }
 
@@ -94,7 +94,7 @@ export interface Milestone {
   completed: string[];
 }
 
-export interface StrataLayers {
+export interface EpistemeLayers {
   research?: string;
   plan?: string;
   planDelta?: string;
@@ -118,10 +118,10 @@ export function buildMilestoneText(
 }
 
 export function blocksToLayers(
-  blocks: StrataBlock[],
-): StrataLayers | undefined {
+  blocks: EpistemeBlock[],
+): EpistemeLayers | undefined {
   if (blocks.length === 0) return undefined;
-  const layers: StrataLayers = { planFresh: false };
+  const layers: EpistemeLayers = { planFresh: false };
   let reports: StepReport[] = [];
   let milestones: Milestone[] = [];
   for (const b of blocks) {
@@ -161,25 +161,25 @@ export function blocksToLayers(
   return layers;
 }
 
-export function extractLayers(text: string): StrataLayers | undefined {
-  return blocksToLayers(extractStrataBlocks(text));
+export function extractLayers(text: string): EpistemeLayers | undefined {
+  return blocksToLayers(extractEpistemeBlocks(text));
 }
 
-export function effectivePlan(layers: StrataLayers): string | undefined {
+export function effectivePlan(layers: EpistemeLayers): string | undefined {
   return layers.planDelta ?? layers.plan;
 }
 
-export function buildStrataSummary(layers: StrataLayers): string {
-  const out: string[] = [STRATA_MARKER];
-  if (layers.research) out.push(strataBlock("RESEARCH", layers.research));
-  if (layers.plan) out.push(strataBlock("PLAN", layers.plan));
+export function buildEpistemeSummary(layers: EpistemeLayers): string {
+  const out: string[] = [EPISTEME_MARKER];
+  if (layers.research) out.push(epistemeBlock("RESEARCH", layers.research));
+  if (layers.plan) out.push(epistemeBlock("PLAN", layers.plan));
   for (const m of layers.milestones ?? [])
-    out.push(strataBlock(`MILESTONE-${m.n}`, m.text));
+    out.push(epistemeBlock(`MILESTONE-${m.n}`, m.text));
   for (const r of layers.reports ?? []) {
     const key = r.key ?? String(r.n);
-    out.push(strataBlock(`STEP-${key}`, r.text));
+    out.push(epistemeBlock(`STEP-${key}`, r.text));
   }
-  if (layers.planDelta) out.push(strataBlock("PLAN-DELTA", layers.planDelta));
+  if (layers.planDelta) out.push(epistemeBlock("PLAN-DELTA", layers.planDelta));
   return out.join(SEP);
 }
 
@@ -187,14 +187,14 @@ export function buildStrataSummary(layers: StrataLayers): string {
 // Display
 // ---------------------------------------------------------------------------
 
-export function stripStrataMarkersForDisplay(md: string): string {
+export function stripEpistemeMarkersForDisplay(md: string): string {
   return md
     .replace(
-      /(^|\n)[ \t]*\/\*STRATA::(?:END::)?(?:RESEARCH|PLAN-DELTA|PLAN|MILESTONE-\d+|STEP-[A-Za-z0-9][A-Za-z0-9_-]*)::v1\*\/[ \t]*\n/g,
+      /(^|\n)[ \t]*\/\*EPISTEME::(?:END::)?(?:RESEARCH|PLAN-DELTA|PLAN|MILESTONE-\d+|STEP-[A-Za-z0-9][A-Za-z0-9_-]*)::v1\*\/[ \t]*\n/g,
       "$1",
     )
     .replace(
-      /\/\*STRATA::(?:END::)?(?:RESEARCH|PLAN-DELTA|PLAN|MILESTONE-\d+|STEP-[A-Za-z0-9][A-Za-z0-9_-]*)::v1\*\//g,
+      /\/\*EPISTEME::(?:END::)?(?:RESEARCH|PLAN-DELTA|PLAN|MILESTONE-\d+|STEP-[A-Za-z0-9][A-Za-z0-9_-]*)::v1\*\//g,
       "",
     );
 }
@@ -296,8 +296,8 @@ export function firstUnreportedPlanStep(
 }
 
 export function planChangeError(
-  prev: StrataLayers | undefined,
-  next: StrataLayers,
+  prev: EpistemeLayers | undefined,
+  next: EpistemeLayers,
 ): string | null {
   const prevPlan = prev ? effectivePlan(prev) : undefined;
   const nextPlan = effectivePlan(next);
@@ -345,7 +345,7 @@ export function planDashboardSegments(
   hasResearch: boolean,
   milestones: readonly MilestoneRef[] = [],
 ): WidgetSegment[] {
-  const brand: WidgetSegment = { text: " strata", color: "accent" };
+  const brand: WidgetSegment = { text: " episteme", color: "accent" };
   if (!plan) {
     return [
       brand,
@@ -379,16 +379,16 @@ export function planDashboardSegments(
 
 export function modeSegments(
   enabled: boolean,
-  mode: "strict" | "light" = "strict",
+  mode: "strict" | "light" = "light",
   paused = false,
 ): WidgetSegment[] {
   if (!enabled)
     return [
-      { text: " strata", color: "accent" },
+      { text: " episteme", color: "accent" },
       { text: "  off", color: "dim" },
     ];
   return [
-    { text: " strata", color: "accent" },
+    { text: " episteme", color: "accent" },
     { text: paused ? "  paused" : `  ${mode}`, color: paused ? "dim" : "success" },
   ];
 }
@@ -427,15 +427,15 @@ export function fitLine(s: string, maxWidth: number): string {
 }
 
 // ---------------------------------------------------------------------------
-// Session strata directory
+// Session episteme directory
 // ---------------------------------------------------------------------------
 
-export interface StrataPaths {
+export interface EpistemePaths {
   dir: string;
   tmp: string;
 }
 
-export function strataPaths(dir: string): StrataPaths {
+export function epistemePaths(dir: string): EpistemePaths {
   return { dir, tmp: join(dir, "tmp") };
 }
 
@@ -453,13 +453,13 @@ export function writeSnapshot(path: string, title: string, body: string): void {
 // Session cleanup
 // ---------------------------------------------------------------------------
 
-const STRATA_DIR_SUFFIX = ".pi_strata";
+const EPISTEME_DIR_SUFFIX = ".pi_episteme";
 
-export function cleanupOrphanedStrataDirs(sessionsDir: string): number {
+export function cleanupOrphanedEpistemeDirs(sessionsDir: string): number {
   let removed = 0;
   for (const entry of readdirSyncSafe(sessionsDir)) {
-    if (!entry.endsWith(STRATA_DIR_SUFFIX)) continue;
-    const sessionFile = entry.slice(0, -STRATA_DIR_SUFFIX.length) + ".jsonl";
+    if (!entry.endsWith(EPISTEME_DIR_SUFFIX)) continue;
+    const sessionFile = entry.slice(0, -EPISTEME_DIR_SUFFIX.length) + ".jsonl";
     if (existsSync(join(sessionsDir, sessionFile))) continue;
     rmSync(join(sessionsDir, entry), { recursive: true, force: true });
     removed += 1;

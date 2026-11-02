@@ -1,21 +1,21 @@
 /**
- * pi-strata — optional configuration.
+ * pi-episteme — optional configuration.
  *
- * Settings live in pi's settings.json files under the `piStrata` key:
+ * Settings live in pi's settings.json files under the `piEpisteme` key:
  *   global:  ~/.pi/agent/settings.json
  *   project: <project>/.pi/settings.json  (fields override global per-field)
  *
- * Priority (per field): environment (PI_STRATA_*) > config > default.
+ * Priority (per field): environment (PI_EPISTEME_*) > config > default.
  * Invalid values at any level are ignored (fall through to the next level).
  *
  * NOTE: the extension on/off mode is NOT a setting — it is per-session
- * state: off by default, enabled for the session with /strata-on (see
- * index.ts). A legacy `piStrata.enabled` field or PI_STRATA_ENABLED in a
+ * state: off by default, enabled for the session with /episteme-on (see
+ * index.ts). A legacy `piEpisteme.enabled` field or PI_EPISTEME_ENABLED in a
  * settings file is ignored.
  *
  * Example (.pi/settings.json):
  *   {
- *     "piStrata": {
+ *     "piEpisteme": {
  *       "autoContinue": false,
  *       "hideAnchors": true
  *     }
@@ -28,34 +28,34 @@ import { CONFIG_DIR_NAME, getAgentDir } from "@earendil-works/pi-coding-agent";
 
 /**
  * Raw config shape (all fields optional). Values are decoded/validated
- * inside readPiStrataConfig, so a decoded config only ever holds valid
+ * inside readPiEpistemeConfig, so a decoded config only ever holds valid
  * values (invalid fields are omitted).
  */
-export interface StrataConfig {
+export interface EpistemeConfig {
  /** Auto-continue the next plan step after step compaction. */
  autoContinue?: boolean;
- /** Hide STRATA marker anchors in the TUI transcript (display only). */
+ /** Hide EPISTEME marker anchors in the TUI transcript (display only). */
  hideAnchors?: boolean;
  /** Token budget per compaction layer; 0 disables the budget. */
  layerTokenBudget?: number;
 }
 
-export interface StrataSettings {
+export interface EpistemeSettings {
  autoContinue: boolean;
  hideAnchors: boolean;
  layerTokenBudget: number;
 }
 
-export const STRATA_DEFAULTS: StrataSettings = {
+export const EPISTEME_DEFAULTS: EpistemeSettings = {
  autoContinue: true,
  hideAnchors: true,
  layerTokenBudget: 16384,
 };
 
 const ENV = {
- autoContinue: "PI_STRATA_AUTO_CONTINUE",
- hideAnchors: "PI_STRATA_HIDE_ANCHORS",
- layerTokenBudget: "PI_STRATA_LAYER_TOKEN_BUDGET",
+ autoContinue: "PI_EPISTEME_AUTO_CONTINUE",
+ hideAnchors: "PI_EPISTEME_HIDE_ANCHORS",
+ layerTokenBudget: "PI_EPISTEME_LAYER_TOKEN_BUDGET",
 } as const;
 
 type JsonScalar = number | string | boolean | null;
@@ -79,19 +79,19 @@ function envBoolean(name: string): boolean | undefined {
 }
 
 /**
- * Read the `piStrata` key from global then project settings.json
+ * Read the `piEpisteme` key from global then project settings.json
  * (project fields win) and decode it: invalid field values are dropped,
  * so the result contains only valid values.
  */
-export function readPiStrataConfig(
+export function readPiEpistemeConfig(
  cwd: string,
  globalSettingsPath?: string,
-): StrataConfig {
+): EpistemeConfig {
  const files = [
   globalSettingsPath ?? join(getAgentDir(), "settings.json"),
   join(cwd, CONFIG_DIR_NAME, "settings.json"),
  ];
- const merged: StrataConfig = {};
+ const merged: EpistemeConfig = {};
  for (const file of files) {
   let raw: unknown;
   try {
@@ -99,7 +99,7 @@ export function readPiStrataConfig(
   } catch {
    continue; // no settings file at this location
   }
-  const section = (raw as { piStrata?: unknown } | null)?.piStrata;
+  const section = (raw as { piEpisteme?: unknown } | null)?.piEpisteme;
   if (!section || typeof section !== "object" || Array.isArray(section)) {
    continue;
   }
@@ -131,7 +131,7 @@ function resolveAutoContinue(cfgAuto: boolean | undefined): boolean {
  if (cfgAuto !== undefined) {
   return cfgAuto;
  }
- return STRATA_DEFAULTS.autoContinue;
+ return EPISTEME_DEFAULTS.autoContinue;
 }
 
 /** Resolve the effective hideAnchors: env > config > default. */
@@ -143,7 +143,7 @@ function resolveHideAnchors(cfgHide: boolean | undefined): boolean {
  if (cfgHide !== undefined) {
   return cfgHide;
  }
- return STRATA_DEFAULTS.hideAnchors;
+ return EPISTEME_DEFAULTS.hideAnchors;
 }
 
 /** Resolve the effective layerTokenBudget: env > config > default. */
@@ -158,17 +158,17 @@ function resolveLayerTokenBudget(cfgBudget: number | undefined): number {
  if (cfgBudget !== undefined) {
   return cfgBudget;
  }
- return STRATA_DEFAULTS.layerTokenBudget;
+ return EPISTEME_DEFAULTS.layerTokenBudget;
 }
 
 /**
  * Resolve effective settings with priority: env > config > default.
  */
-export function resolveStrataSettings(
+export function resolveEpistemeSettings(
  cwd: string,
  globalSettingsPath?: string,
-): StrataSettings {
- const cfg = readPiStrataConfig(cwd, globalSettingsPath);
+): EpistemeSettings {
+ const cfg = readPiEpistemeConfig(cwd, globalSettingsPath);
  return {
   autoContinue: resolveAutoContinue(cfg.autoContinue),
   hideAnchors: resolveHideAnchors(cfg.hideAnchors),

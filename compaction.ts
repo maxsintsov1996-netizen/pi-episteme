@@ -1,10 +1,10 @@
 /**
- * pi-strata — compaction integration.
+ * pi-episteme — compaction integration.
  *
  * Plan/step compactions cut at a non-context sentinel, leaving only the
- * deterministic strata summary. Plain compactions retain pi's normal tail and
+ * deterministic episteme summary. Plain compactions retain pi's normal tail and
  * summarize only the ephemeral span. New layer markers are trusted exclusively
- * in assistant text and in a previous canonical strata summary.
+ * in assistant text and in a previous canonical episteme summary.
  */
 
 import {
@@ -19,19 +19,19 @@ import {
 import { join } from "node:path";
 import {
   SEP,
-  STRATA_MARKER,
-  STRATA_VERSION,
+  EPISTEME_MARKER,
+  EPISTEME_VERSION,
   buildMilestoneText,
-  buildStrataSummary,
+  buildEpistemeSummary,
   completedStepIds,
   estimateTextTokens,
   extractLayers,
   normalizeText,
-  strataPaths,
-  stripStrataBlocks,
+  epistemePaths,
+  stripEpistemeBlocks,
   writeSnapshot,
-  type StrataLayers,
-} from "./strata.ts";
+  type EpistemeLayers,
+} from "./episteme.ts";
 
 type Preparation = SessionBeforeCompactEvent["preparation"];
 type ConversationMessage = Preparation["messagesToSummarize"][number];
@@ -39,10 +39,10 @@ type LlmResult = Pick<CompactionResult, "summary" | "usage">;
 
 const FALLBACK_TAIL_CHARS = 12000;
 const FALLBACK_HEADER =
-  "## PI-STRATA RAW CHECKPOINT\nLLM summarization unavailable. This bounded raw tail preserves interrupted work; older discarded logs are omitted.";
+  "## PI-EPISTEME RAW CHECKPOINT\nLLM summarization unavailable. This bounded raw tail preserves interrupted work; older discarded logs are omitted.";
 
-export interface StrataRuntime {
-  strataDir: string | null;
+export interface EpistemeRuntime {
+  epistemeDir: string | null;
   pending: {
     kind: "plan" | "step";
     stepId?: string;
@@ -53,8 +53,8 @@ export interface StrataRuntime {
   ensureBoundary?: (ctx: ExtensionContext) => string;
 }
 
-export interface StrataDetails {
-  strata: {
+export interface EpistemeDetails {
+  episteme: {
     mode: "plan" | "step" | "plain";
     version: string;
     stepN?: number;
@@ -69,14 +69,14 @@ export interface StrataDetails {
 
 export type BeforeCompactResult = {
   cancel?: boolean;
-  compaction?: CompactionResult<StrataDetails>;
+  compaction?: CompactionResult<EpistemeDetails>;
 };
 
 const PLAIN_FOCUS =
-  "Summarize only the ephemeral work in this conversation: tool outputs, findings, in-progress file changes, errors, and decisions not yet recorded in a step report. Preserve enough detail to resume the interrupted work. Any pi-strata layers were removed from your input and are preserved separately.";
+  "Summarize only the ephemeral work in this conversation: tool outputs, findings, in-progress file changes, errors, and decisions not yet recorded in a step report. Preserve enough detail to resume the interrupted work. Any pi-episteme layers were removed from your input and are preserved separately.";
 
 const MILESTONE_FOCUS =
-  "Create a durable milestone digest of the completed STEP reports in this strata conversation. Preserve facts needed by remaining plan items: changed files, verification results, decisions, constraints, risks, and unresolved issues. Do not invent progress. The extension will separately retain the completed step IDs.";
+  "Create a durable milestone digest of the completed STEP reports in this episteme conversation. Preserve facts needed by remaining plan items: changed files, verification results, decisions, constraints, risks, and unresolved issues. Do not invent progress. The extension will separately retain the completed step IDs.";
 
 export type PlainSummarizer = (
   preparation: Preparation,
@@ -85,7 +85,7 @@ export type PlainSummarizer = (
 ) => Promise<LlmResult>;
 
 export type MilestoneSummarizer = (
-  layers: StrataLayers,
+  layers: EpistemeLayers,
   preparation: Preparation,
   ctx: ExtensionContext,
   signal: AbortSignal,
@@ -136,7 +136,7 @@ const defaultMilestoneSummarizer: MilestoneSummarizer = async (
 ) => {
   const message = {
     role: "user",
-    content: buildStrataSummary(layers),
+    content: buildEpistemeSummary(layers),
     timestamp: Date.now(),
   } as ConversationMessage;
   const result = await runPiSummary(
@@ -195,8 +195,10 @@ export function stripLayersFromMessages(
     }
     const content = message.content;
     if (typeof content === "string") {
-      const text = stripStrataBlocks(content);
+      const text = stripEpistemeBlocks(content);
       if (text)
+        // SAFETY: only the assistant text content was narrowed/cleaned; the
+        // message keeps its role, timestamp, and every other field.
         result.push({ ...message, content: text } as unknown as ConversationMessage);
       continue;
     }
@@ -206,7 +208,7 @@ export function stripLayersFromMessages(
     }
     const filtered = content.flatMap((block) => {
       if (block.type !== "text" || typeof block.text !== "string") return [block];
-      const text = stripStrataBlocks(block.text);
+      const text = stripEpistemeBlocks(block.text);
       return text ? [{ ...block, text }] : [];
     });
     if (filtered.length > 0)
@@ -216,19 +218,19 @@ export function stripLayersFromMessages(
 }
 
 function previousCanonicalSummary(summary: string | undefined): string | undefined {
-  if (!summary?.startsWith(STRATA_MARKER)) return undefined;
+  if (!summary?.startsWith(EPISTEME_MARKER)) return undefined;
   let canonical: string | undefined;
-  let cursor = STRATA_MARKER.length;
+  let cursor = EPISTEME_MARKER.length;
   while (summary.startsWith(SEP, cursor)) {
     const rest = summary.slice(cursor + SEP.length);
-    const open = /^\/\*STRATA::(RESEARCH|PLAN-DELTA|PLAN|MILESTONE-\d+|STEP-[A-Za-z0-9][A-Za-z0-9_-]*)::v1\*\//.exec(rest);
+    const open = /^\/\*EPISTEME::(RESEARCH|PLAN-DELTA|PLAN|MILESTONE-\d+|STEP-[A-Za-z0-9][A-Za-z0-9_-]*)::v1\*\//.exec(rest);
     if (!open) break;
-    const close = `/*STRATA::END::${open[1]}::v1*/`;
+    const close = `/*EPISTEME::END::${open[1]}::v1*/`;
     const closeIndex = rest.indexOf(close, open[0].length);
     if (closeIndex < 0) break;
     const candidate = summary.slice(0, cursor + SEP.length + closeIndex + close.length);
     const layers = extractLayers(candidate);
-    if (!layers || buildStrataSummary(layers) !== candidate) break;
+    if (!layers || buildEpistemeSummary(layers) !== candidate) break;
     canonical = candidate;
     cursor = candidate.length;
   }
@@ -236,35 +238,35 @@ function previousCanonicalSummary(summary: string | undefined): string | undefin
 }
 
 function fallbackCheckpoint(discardedSerialized: string): string | undefined {
-  const clean = stripStrataBlocks(discardedSerialized);
+  const clean = stripEpistemeBlocks(discardedSerialized);
   if (!clean) return undefined;
   const tail = clean.slice(-FALLBACK_TAIL_CHARS);
   return `${FALLBACK_HEADER}\n\n${tail}`;
 }
 
 async function maybeRollover(
-  initial: StrataLayers,
+  initial: EpistemeLayers,
   preparation: Preparation,
   ctx: ExtensionContext,
   signal: AbortSignal,
-  rt: StrataRuntime,
+  rt: EpistemeRuntime,
   dir: string,
   summarize: MilestoneSummarizer,
-): Promise<{ layers: StrataLayers; epoch?: number }> {
+): Promise<{ layers: EpistemeLayers; epoch?: number }> {
   const budget = rt.layerTokenBudget ?? 16384;
   const reports = initial.reports ?? [];
   if (
     budget === 0 ||
     reports.length === 0 ||
-    estimateTextTokens(buildStrataSummary(initial)) <= budget
+    estimateTextTokens(buildEpistemeSummary(initial)) <= budget
   )
     return { layers: initial };
 
   const epoch = Math.max(0, ...(initial.milestones ?? []).map((m) => m.n)) + 1;
   writeSnapshot(
-    join(strataPaths(dir).tmp, `epoch_${epoch}_layers.md`),
+    join(epistemePaths(dir).tmp, `epoch_${epoch}_layers.md`),
     `epoch ${epoch} layers`,
-    buildStrataSummary(initial),
+    buildEpistemeSummary(initial),
   );
   try {
     const digest = await summarize(initial, preparation, ctx, signal);
@@ -286,7 +288,7 @@ async function maybeRollover(
     if (signal.aborted) throw err;
     if (ctx.hasUI)
       ctx.ui.notify(
-        "pi-strata: milestone summarization unavailable; full step reports retained",
+        "pi-episteme: milestone summarization unavailable; full step reports retained",
         "warning",
       );
     return { layers: initial };
@@ -296,13 +298,13 @@ async function maybeRollover(
 export async function handleSessionBeforeCompact(
   event: SessionBeforeCompactEvent,
   ctx: ExtensionContext,
-  rt: StrataRuntime,
+  rt: EpistemeRuntime,
   deps?: {
     summarizePlain?: PlainSummarizer;
     summarizeMilestone?: MilestoneSummarizer;
   },
 ): Promise<BeforeCompactResult | undefined> {
-  const dir = rt.strataDir;
+  const dir = rt.epistemeDir;
   if (!dir) return undefined;
 
   const { preparation, branchEntries } = event;
@@ -348,12 +350,12 @@ export async function handleSessionBeforeCompact(
     stepN = rt.pending.stepN;
     stepId = rt.pending.stepId;
     const boundaryId = rt.pending.boundaryId ?? rt.ensureBoundary?.(ctx);
-    if (!boundaryId) throw new Error("pi-strata: no phase-boundary entry available");
+    if (!boundaryId) throw new Error("pi-episteme: no phase-boundary entry available");
     firstKeptEntryId = boundaryId;
     if (mode === "step") {
       const id = stepId ?? String(stepN ?? 0);
       writeSnapshot(
-        join(strataPaths(dir).tmp, `step_${id}_raw.md`),
+        join(epistemePaths(dir).tmp, `step_${id}_raw.md`),
         `step ${id}`,
         serialized,
       );
@@ -392,23 +394,23 @@ export async function handleSessionBeforeCompact(
       rawFallback = true;
       if (ctx.hasUI)
         ctx.ui.notify(
-          "pi-strata: pi summarization unavailable; preserving a bounded raw checkpoint",
+          "pi-episteme: pi summarization unavailable; preserving a bounded raw checkpoint",
           "warning",
         );
     }
   }
 
-  const strataSummary = buildStrataSummary(layers);
+  const epistemeSummary = buildEpistemeSummary(layers);
   const tail = llm
     ? normalizeText(llm.summary)
     : rawFallback
       ? fallbackCheckpoint(discardedSerialized)
       : undefined;
-  const summary = tail ? `${strataSummary}${SEP}${tail}` : strataSummary;
-  const details: StrataDetails = {
-    strata: {
+  const summary = tail ? `${epistemeSummary}${SEP}${tail}` : epistemeSummary;
+  const details: EpistemeDetails = {
+    episteme: {
       mode,
-      version: STRATA_VERSION,
+      version: EPISTEME_VERSION,
       stepN,
       stepId,
       reportFiles: (layers.reports ?? [])

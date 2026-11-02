@@ -2,11 +2,11 @@
 
 "use strict";
 
-const url = process.env.PI_STRATA_TEST_URL?.trim();
-const model = process.env.PI_STRATA_TEST_MODEL?.trim();
+const url = process.env.PI_EPISTEME_TEST_URL?.trim();
+const model = process.env.PI_EPISTEME_TEST_MODEL?.trim();
 const missing = [
-  !url && "PI_STRATA_TEST_URL",
-  !model && "PI_STRATA_TEST_MODEL",
+  !url && "PI_EPISTEME_TEST_URL",
+  !model && "PI_EPISTEME_TEST_MODEL",
 ].filter(Boolean);
 
 if (missing.length > 0) {
@@ -20,10 +20,10 @@ const prefix = [
   {
     role: "system",
     content: [
-      "You are the STRATA local smoke benchmark.",
+      "You are the EPISTEME local smoke benchmark.",
       "Preserve the stable project, research, and plan layers below.",
       "Reply with exactly one token.",
-      "PROJECT: pi-strata context compaction",
+      "PROJECT: pi-episteme context compaction",
       "RESEARCH: stable prefixes can reuse provider-side KV caches.",
       "PLAN: compare two requests with an append-only ephemeral tail.",
     ].join("\n"),
@@ -51,7 +51,7 @@ function bounded(value, limit = 1000) {
 
 async function request(messages) {
   const headers = { "content-type": "application/json" };
-  const apiKey = process.env.PI_STRATA_TEST_API_KEY;
+  const apiKey = process.env.PI_EPISTEME_TEST_API_KEY;
   if (apiKey) {
     headers.authorization = `Bearer ${apiKey}`;
   }
@@ -125,10 +125,10 @@ function reportedCachedTokens(data) {
 async function main() {
   const endpoint = new URL(url);
   if (endpoint.protocol !== "http:" && endpoint.protocol !== "https:") {
-    throw new Error("PI_STRATA_TEST_URL must use http or https.");
+    throw new Error("PI_EPISTEME_TEST_URL must use http or https.");
   }
 
-  console.log(`STRATA local smoke benchmark for model ${model}`);
+  console.log(`EPISTEME local smoke benchmark for model ${model}`);
   const first = await request(firstMessages);
   report("Request 1", first);
   const second = await request(secondMessages);

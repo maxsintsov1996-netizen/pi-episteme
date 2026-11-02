@@ -1,13 +1,13 @@
 {
-  "name": "pi-strata",
+  "name": "pi-episteme",
   "version": "0.1.0",
-  "description": "Advanced context compaction for pi-coding-agent: a phased pipeline (research → plan → steps) with a byte-stable prefix and KV-cache reuse for local LLMs.",
+  "description": "Context-aware agent orchestration for pi-coding-agent with local LLMs: layered KV-cache-friendly context (research → plan → steps) plus a file-less GVS-style pipeline (Manager → Workers → Verifier) with a byte-stable prompt prefix.",
   "type": "module",
   "license": "MIT",
-  "keywords": ["pi-package", "pi", "pi-coding-agent", "context", "compaction", "kv-cache", "llm"],
-  "homepage": "https://github.com/maxsintsov1996-netizen/pi-strata#readme",
+  "keywords": ["pi-package", "pi", "pi-coding-agent", "context", "compaction", "orchestration", "multi-agent", "kv-cache", "llm"],
+  "homepage": "https://github.com/maxsintsov1996-netizen/pi-episteme#readme",
   "bugs": {
-    "url": "https://github.com/maxsintsov1996-netizen/pi-strata/issues"
+    "url": "https://github.com/maxsintsov1996-netizen/pi-episteme/issues"
   },
   "engines": {
     "node": ">=22.19.0"
@@ -17,25 +17,27 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/maxsintsov1996-netizen/pi-strata.git"
+    "url": "git+https://github.com/maxsintsov1996-netizen/pi-episteme.git"
   },
   "pi": {
     "extensions": [
       "./index.ts"
     ],
-    "image": "https://raw.githubusercontent.com/maxsintsov1996-netizen/pi-strata/master/img/pi-strata.png"
+    "image": "https://raw.githubusercontent.com/maxsintsov1996-netizen/pi-episteme/master/img/pi-episteme.png"
   },
   "files": [
     "index.ts",
-    "strata.ts",
+    "episteme.ts",
     "compaction.ts",
     "config.ts",
+    "context.ts",
+    "orchestrator.ts",
     "check.cjs",
     "local-check.cjs",
     "README.md",
     "README.ru.md",
     "SPEC.md",
-    "img/pi-strata.png"
+    "img/pi-episteme.png"
   ],
   "scripts": {
     "test": "node check.cjs",
