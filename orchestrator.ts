@@ -24,7 +24,9 @@ import {
   buildOrchestrationContext,
   managerFixTail,
   managerPlanningTail,
+  stepVerifierTail,
   verifierTail,
+  workerFixTail,
   workerTail,
   type OrchestrationContext,
 } from "./context.ts";
@@ -47,8 +49,10 @@ export interface OrchestratorDeps {
 }
 
 export interface OrchestratorOptions {
-  /** Corrective rounds after a failed verification. Default 2. */
+  /** Corrective rounds after a failed whole-plan verification. Default 2. */
   maxFixRounds?: number;
+  /** Fix attempts per plan item at its own gate. Default 2. */
+  maxStepFixRounds?: number;
   signal?: AbortSignal;
   /** Phase transitions, for UI notifications and tests. */
   onPhase?: (phase: string) => void;
@@ -75,6 +79,26 @@ const DEFAULT_FIX_ROUNDS = 2;
  * value would turn a typo into an unattended loop over the real working tree.
  */
 export const MAX_FIX_ROUNDS = 10;
+
+/**
+ * Fix attempts a plan item gets at its OWN verification gate. A gate is one
+ * tool-using Verifier session plus one Worker session per attempt, so this
+ * stays small: an item that cannot pass after a couple of focused attempts is
+ * better reported to the Manager's corrective round than ground at again.
+ */
+export const DEFAULT_STEP_FIX_ROUNDS = 2;
+export const MAX_STEP_FIX_ROUNDS = 4;
+
+// A plan item is worth its own Verifier session only if it declares something
+// to run: a command in backticks, or a well-known tool/package-manager binary.
+// Items that are pure reading/writing get judged by the final whole-plan check.
+const VERIFICATION_HINT_RE =
+  /`[^`]+`|\b(npm|npx|pnpm|yarn|bun|cargo|make|cmake|ctest|meson|pytest|tox|ruff|eslint|biome|oxlint|tsc|deno|node|python3?|pytest|mvn|gradle|dotnet|rspec|phpunit|composer|swift|go\s+(?:test|build|vet)|git\s+(?:diff|status|log)|docker|kubectl|curl\s+http)/;
+
+/** Does this plan item declare a command that can be re-run independently? */
+export function itemHasVerification(text: string): boolean {
+  return VERIFICATION_HINT_RE.test(text);
+}
 
 /**
  * Corrective-round budget: env PI_EPISTEME_ORCH_FIX_ROUNDS (non-negative
@@ -151,6 +175,22 @@ export function verifierVerdict(finalText: string): {
   };
 }
 
+/** Insert or replace the STEP report for one plan item. */
+function setReport(
+  layers: EpistemeLayers,
+  report: { key: string; text: string },
+): EpistemeLayers {
+  const reports = layers.reports ?? [];
+  const at = reports.findIndex((r) => r.key === report.key);
+  return {
+    ...layers,
+    reports:
+      at >= 0
+        ? reports.map((r, i) => (i === at ? report : r))
+        : [...reports, report],
+  };
+}
+
 function validatePlan(layers: EpistemeLayers): string | null {
   const plan = effectivePlan(layers);
   if (!layers.research) return "manager reply has no RESEARCH block";
@@ -174,6 +214,10 @@ export async function runOrchestration(
   const maxFixRounds = Math.min(
     MAX_FIX_ROUNDS,
     Math.max(0, options.maxFixRounds ?? DEFAULT_FIX_ROUNDS),
+  );
+  const maxStepFixRounds = Math.min(
+    MAX_STEP_FIX_ROUNDS,
+    Math.max(0, options.maxStepFixRounds ?? DEFAULT_STEP_FIX_ROUNDS),
   );
   const { signal, onPhase } = options;
   let layers: EpistemeLayers = { planFresh: false };
@@ -217,9 +261,14 @@ export async function runOrchestration(
 
   // -- Phase 2: execute steps, verify, correct — until pass or round budget.
   for (;;) {
-    let plan = effectivePlan(layers);
+    // Items that failed their own gate in THIS round. They are independently
+    // observed defects, so they keep the run failing even if the final
+    // Verifier happens to pass; they feed the Manager's corrective round.
+    const gateIssues: string[] = [];
+
     for (;;) {
       throwIfAborted(signal);
+      const plan = effectivePlan(layers);
       const idx = plan
         ? firstUnreportedPlanStep(plan, layers.reports ?? [], layers.milestones ?? [])
         : -1;
@@ -231,17 +280,39 @@ export async function runOrchestration(
         signal,
       );
       throwIfAborted(signal);
-      const report = workerReport(item.id, finalText);
-      const reports = layers.reports ?? [];
-      const at = reports.findIndex((r) => r.key === report.key);
-      layers = {
-        ...layers,
-        reports:
-          at >= 0
-            ? reports.map((r, i) => (i === at ? report : r))
-            : [...reports, report],
-      };
-      plan = effectivePlan(layers);
+      layers = setReport(layers, workerReport(item.id, finalText));
+
+      // Per-item gate: a checked item never carries a known defect into the
+      // next one. Only items that declare something to run get their own
+      // session — a Verifier run for a prose-only item buys nothing.
+      if (!itemHasVerification(item.text)) continue;
+      for (let attempt = 0; ; ) {
+        throwIfAborted(signal);
+        onPhase?.(`step-verifier:${item.id}`);
+        const gateText = await deps.runAgent(
+          buildOrchestrationContext(layers, stepVerifierTail(item)),
+          signal,
+        );
+        throwIfAborted(signal);
+        const gate = verifierVerdict(gateText);
+        if (gate.verdict === "pass") break;
+        if (attempt >= maxStepFixRounds) {
+          const unresolved = gate.issues.length
+            ? gate.issues
+            : [`step ${item.id} failed its verification gate`];
+          for (const issue of unresolved) gateIssues.push(`${item.id}: ${issue}`);
+          break;
+        }
+        attempt += 1;
+        onPhase?.(`worker:${item.id}:fix-${attempt}`);
+        const fixText = await deps.runAgent(
+          buildOrchestrationContext(layers, workerFixTail(item, gate.issues)),
+          signal,
+        );
+        throwIfAborted(signal);
+        // Same item, same ID, updated report — the plan is never rewritten here.
+        layers = setReport(layers, workerReport(item.id, fixText));
+      }
     }
 
     onPhase?.("verifier");
@@ -251,7 +322,7 @@ export async function runOrchestration(
     );
     throwIfAborted(signal);
     const verdict = verifierVerdict(verdictText);
-    if (verdict.verdict === "pass") {
+    if (verdict.verdict === "pass" && gateIssues.length === 0) {
       return {
         ok: true,
         summary: verdict.summary,
@@ -261,11 +332,15 @@ export async function runOrchestration(
         issues: [],
       };
     }
-    issues = verdict.issues;
+    issues = [...verdict.issues, ...gateIssues];
     if (rounds >= maxFixRounds)
       return {
         ok: false,
-        summary: verdict.summary || `verification failed after ${rounds} corrective round(s)`,
+        summary:
+          verdict.verdict === "pass"
+            ? `the whole-plan check passed, but ${gateIssues.length} item(s) failed their own verification gate`
+            : verdict.summary ||
+              `verification failed after ${rounds} corrective round(s)`,
         layers,
         rounds,
         completed: [

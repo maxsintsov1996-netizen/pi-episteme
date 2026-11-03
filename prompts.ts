@@ -21,11 +21,25 @@ export const INSTRUCTIONS_CUSTOM_TYPE = "episteme-instructions";
 
 export type EpistemeMode = "strict" | "light";
 
-/** The one sentence that differs between light and strict sessions. */
+/**
+ * The mode contract. Both modes share the layered protocol below and the same
+ * structural (rule-based) layer compaction; they differ in WHO executes the
+ * plan. light = this session's agent, alone, exactly as pi-strata worked.
+ * strict = a GVS run: Manager plans, Workers execute single items, each item
+ * with a verification command passes its own Verifier gate, a final Verifier
+ * judges the whole plan.
+ */
 function activationRule(mode: EpistemeMode): string {
   if (mode === "strict")
-    return "Strict mode: use the pipeline below for every implementation task. For questions, clarification, or discussion without a task, just answer without markers.";
-  return "Light mode: answer questions and complete small tasks normally, without markers. Start the full pipeline below only when a task is substantial enough to benefit from phased context.";
+    return 'Strict mode: the pipeline below is the bookkeeping, but substantive implementation work goes through the GVS pipeline — call episteme(action="orchestrate", task="…") (or /episteme-orchestrate <task>) and let Manager → Worker → per-item Verifier gate → Verifier execute it. Do not grind such a task out yourself item by item. Manual advance stays available and correct for small tasks, for continuing work a run left unfinished, and for recovering from a failed run. For questions, clarification, or discussion without a task, just answer without markers.';
+  return "Light mode: you work alone — no subagent runs, no orchestration. Answer questions and complete small tasks normally, without markers. When a task is substantial enough to benefit from phased context, run the pipeline below yourself: write RESEARCH and PLAN, execute one item at a time, close each with a STEP-ID report and advance. Orchestration is unavailable here; /episteme-on strict turns it on.";
+}
+
+/** The execution-model rule that follows from the mode. */
+function executionRule(mode: EpistemeMode): string {
+  if (mode === "strict")
+    return "- Real work prefers a GVS run: its Manager writes RESEARCH and PLAN, its Workers execute exactly one item each, every item that declares a verification command is checked by its own independent Verifier gate (with bounded fix attempts), and a final Verifier judges the whole plan. When a run reports its blocks, re-emit them so this session keeps the layers. Never call orchestrate while another run is live; /episteme abort stops one.";
+  return "- You are the only executor in this mode: implement items yourself, in plan order. The layers survive compaction by structural extraction (they are re-emitted verbatim, not paraphrased), so a report you wrote stays readable years later in a compacted session — keep it factual and self-contained.";
 }
 
 /** Static per-session instructions appended to the system prompt (layer 0). */
@@ -57,6 +71,7 @@ Pipeline:
 5. Reports and MILESTONE digests are the information store for later steps. Do not omit key facts.
 
 Rules:
+${executionRule(mode)}
 - PLAN and PLAN-DELTA are FLAT lists: every item is one top-level "- [id:…] …" line starting at column 0. Do not nest sub-bullets and do not put plan items inside a code fence — only top-level bullets are tracked, and every tracked item must eventually carry a STEP report. Put details in the item text or in RESEARCH.
 - Do not re-emit PLAN to tick checkboxes. Progress comes from STEP and MILESTONE completion records.
 - To change the current plan, write PLAN-DELTA containing the FULL new effective plan with the same IDs for existing items. Completed item IDs and their action text are immutable. Add new work under fresh IDs.
@@ -83,6 +98,14 @@ export function buildEpistemeActivationMessage(
   );
 }
 
+/** What switching modes actually grants or takes away, for the model. */
+function modeSwitchNote(previous: EpistemeMode, next: EpistemeMode): string {
+  if (previous === next) return "";
+  return next === "strict"
+    ? ' GVS orchestration is now available: use episteme(action="orchestrate") for substantive implementation work.'
+    : ' GVS orchestration is no longer available — episteme(action="orchestrate") will be rejected; execute plan items yourself.';
+}
+
 /** Supersedes an earlier activation notice when the mode is switched in place. */
 export function buildEpistemeModeSwitchMessage(
   epistemeDir: string,
@@ -90,8 +113,9 @@ export function buildEpistemeModeSwitchMessage(
   next: EpistemeMode,
 ): string {
   return (
-    `[pi-episteme] Mode switched: ${previous} → ${next}. ` +
-    "The standing instructions below supersede the earlier activation; " +
+    `[pi-episteme] Mode switched: ${previous} → ${next}.` +
+    modeSwitchNote(previous, next) +
+    " The standing instructions below supersede the earlier activation; " +
     "the previous set no longer applies.\n\n" +
     buildEpistemeActivationMessage(epistemeDir, next)
   );

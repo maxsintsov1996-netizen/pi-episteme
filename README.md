@@ -74,11 +74,23 @@ base PLAN is required before `advance` is accepted.
 
 ## Workflow and compaction
 
-1. Episteme is session state and starts **off**. Enable `/episteme-on`
-   (light by default) to handle questions and small tasks normally and use
-   the pipeline only for substantial work, or `/episteme-on strict` for the
-   pipeline on every implementation task. Re-run the command with the other
-   mode to switch without `/episteme-off`.
+1. Episteme is session state and starts **off**. Both modes share the layered
+   protocol and the same structural layer compaction; they differ in **who
+   executes the plan**:
+
+   `/episteme-on` (**light**, the default): the session's own agent works
+   alone, exactly as pi-strata did — it writes RESEARCH/PLAN, implements items
+   one at a time, closes each with a STEP-ID report and `advance`; questions and
+   small tasks stay marker-free. **GVS orchestration is not available here.**
+
+   `/episteme-on strict`: the layered protocol stays the bookkeeping, but
+   substantive implementation work runs through the GVS pipeline (Manager →
+   Worker → per-item Verifier gate → Verifier, see *Orchestration*). The agent
+   is told not to grind such a task out item by item itself. Manual `advance`
+   remains valid for small tasks, for continuing what a run left open, and for
+   recovery after a failed run.
+
+   Re-run the command with the other mode to switch without `/episteme-off`.
 2. In an existing conversation, standing instructions are first appended as a
    message to avoid changing the cached system prefix; they move into the
    system prompt after the next compaction. In an empty session they are added
@@ -115,12 +127,13 @@ request, and queues a notice revoking the standing instructions. While off,
 normal pi compaction is used and `advance` is rejected; `status` still works.
 Resumed sessions also start off, with a notice if existing layers are found.
 
-## Orchestration (Stage 1)
+## Orchestration (strict mode)
 
-For complex tasks, `episteme(action="orchestrate", task="…")` (or
-`/episteme-orchestrate <task>`) runs the pipeline. Like `advance`, it requires an
-enabled session (`/episteme-on`): orchestration writes Episteme layers, and with
-the mode off pi's default summarizer would swallow them:
+GVS orchestration **is** what strict mode means. `episteme(action="orchestrate",
+task="…")` (or `/episteme-orchestrate <task>`) requires a strict session: in
+light mode the session's own agent runs the plan, and the call is refused with
+an error naming the switch. With the mode off entirely, pi's default summarizer
+would also swallow the layers the run produces:
 
 1. **Manager** (chat-only model call) writes RESEARCH and a base PLAN in
    Episteme marker blocks. Malformed plans are fed back once for a retry.
@@ -128,6 +141,17 @@ the mode off pi's default summarizer would swallow them:
    in-memory agent session per item (default coding tools, fresh context each
    time). A Worker ends with a STEP-ID report; without a marker block its final
    message is kept as the report.
+
+   **Per-item gate.** If an item declares something to run (a command in
+   backticks, or a recognisable tool such as `npm`, `pytest`, `go test`, `tsc`),
+   an independent Verifier session checks *that item alone* right after its
+   Worker, and on a fail verdict the same item goes back to a Worker with the
+   issues (scope unchanged, ID unchanged) for up to 2 fix attempts. Items with
+   nothing to re-run are judged once by the final whole-plan Verifier instead of
+   paying for a session that could only read files. An item that still fails
+   after its attempts does not abort the run: it is recorded as an independently
+   observed defect, keeps the run failed even if the final verdict says pass, and
+   feeds the Manager's corrective round.
 
    Workers load with `noExtensions` so a run cannot recurse into pi-episteme.
    In pi, tool permission is itself an extension, so pi-episteme re-attaches
@@ -187,7 +211,8 @@ degraded continuation, it queues the next unfinished plan item. `/episteme pause
 suppresses only auto-continue, not execution or compaction; `/episteme resume`
 re-enables it and queues the next item when idle.
 
-The TUI shows plan progress or the current strict/light/off/paused mode.
+The TUI shows plan progress or the current strict/light/off/paused mode (and
+whether GVS orchestration is available in it).
 Marker anchors are hidden by default in the display only; the session and
 model context retain them. Raw snapshots can be removed with `/episteme reset`.
 Orphaned snapshot directories for deleted sessions are cleaned at session
@@ -239,10 +264,11 @@ adds no runtime package dependency.
   instead of silently showing status.
 - `/episteme pause` and `/episteme resume` — pause/resume auto-continue.
 - `/episteme-on [strict|light]` — enable the session in the selected mode
-  (light by default; re-run with the other mode to switch).
+  (light = the agent works alone; strict = GVS pipeline; light by default,
+  re-run with the other mode to switch).
 - `/episteme-off` — disable the session and revoke standing instructions.
-- `/episteme-orchestrate <task>` — run the orchestration pipeline from the
-  command line (same as the `orchestrate` tool action).
+- `/episteme-orchestrate <task>` — run the GVS pipeline from the command line
+  (same as the `orchestrate` tool action); strict mode only.
 
 ## Configuration
 

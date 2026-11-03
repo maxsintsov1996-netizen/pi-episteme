@@ -40,7 +40,7 @@ Layer legend:
 Role contract:
 - Manager plans in Episteme marker blocks (/*EPISTEME::RESEARCH::v1*/ … /*EPISTEME::END::RESEARCH::v1*/).
 - Worker edits files with tools and ends its final message with a STEP report in /*EPISTEME::STEP-<id>::v1*/ … markers.
-- Verifier independently re-runs the verification commands and ends its final message with one JSON object: {"verdict":"pass"|"fail","issues":["…"],"summary":"…"}.`;
+- Verifier independently re-runs the verification commands and ends its final message with one JSON object: {"verdict":"pass"|"fail","issues":["…"],"summary":"…"}. It runs both as a per-item gate (one plan item) and as the final whole-plan check; the reply format is identical.`;
 
 export type OrchestrationRole = "manager" | "worker" | "verifier";
 
@@ -111,6 +111,46 @@ Independently verify the completed work against the acceptance criteria in RESEA
 
 Reply with ONLY one JSON object, no prose:
 {"verdict":"pass"|"fail","issues":["concrete problem 1","problem 2"],"summary":"one paragraph: what was checked and the overall result"}`;
+}
+
+/**
+ * Per-item Verifier gate: the same independent judgement as the final check,
+ * scoped to ONE plan item, run right after its Worker. Only items that declare
+ * a verification command get this extra session.
+ */
+export function stepVerifierTail(item: { id: string; text: string }): string {
+  return `[ROLE: VERIFIER — gate for step ${item.id}]
+
+Verify exactly this plan item and nothing else:
+- [id:${item.id}] ${item.text}
+
+Run the item's own verification command(s) yourself and inspect the files it touched. Judge actual files and command outputs, not the worker's reasoning. Report only concrete defects in THIS item; whole-plan concerns belong to the final check.
+
+Reply with ONLY one JSON object, no prose:
+{"verdict":"pass"|"fail","issues":["concrete problem 1","problem 2"],"summary":"one sentence: what was run and the result"}`;
+}
+
+/**
+ * Worker, corrective attempt on the SAME item after a failed gate. The item
+ * text is unchanged (its ID and text stay immutable in the plan); the verifier
+ * issues arrive as input, not as a plan rewrite.
+ */
+export function workerFixTail(
+  item: { id: string; text: string },
+  issues: readonly string[],
+): string {
+  return `[ROLE: WORKER — step ${item.id}, fix attempt]
+
+Your previous attempt at this plan item did not pass independent verification. Issues:
+${issues.map((issue) => `- ${issue}`).join("\n")}
+
+Fix them within this same plan item — do not widen its scope:
+- [id:${item.id}] ${item.text}
+
+Re-run the item's verification command(s) until they pass, then end your final message with an updated report:
+/*EPISTEME::STEP-${item.id}::v1*/
+10–30 lines: work done, files changed, verification results, decisions, risks.
+/*EPISTEME::END::STEP-${item.id}::v1*/`;
 }
 
 /** Assemble a full call: stable prefix + dynamic role tail. */

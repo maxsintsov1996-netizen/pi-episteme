@@ -206,12 +206,6 @@ function resolveEpistemeDir(ctx: ExtensionContext): string {
   return join(getAgentDir(), "episteme", sm.getSessionId());
 }
 
-/**
- * True when the branch already carries LLM context: any session entry that
- * produces context messages (a message, a compaction summary, …). A
- * mid-session system-prompt change in that case would invalidate the whole
- * KV-cache prefix and make the local model re-read the entire session.
- */
 /** The system-prompt state line in `/episteme` status. */
 export function syspromptStateLabel(
   enabled: boolean,
@@ -219,6 +213,17 @@ export function syspromptStateLabel(
 ): string {
   if (!enabled) return "inactive";
   return deferred ? "deferred (next compaction)" : "active";
+}
+
+/**
+ * The user-facing consequence of a mode: light runs the plan with this session
+ * alone; strict is the mode where the GVS pipeline (and therefore
+ * episteme(action="orchestrate")) exists.
+ */
+export function modeCapabilityLabel(mode: EpistemeMode): string {
+  return mode === "strict"
+    ? "GVS orchestration available"
+    : "single-agent pipeline; /episteme-on strict enables GVS";
 }
 
 /** "step:S1, + pi summary, epoch 2" — the compaction notification suffix. */
@@ -232,6 +237,12 @@ export function compactionLabel(ep: EpistemeDetails["episteme"]): string {
   return parts.join(", ");
 }
 
+/**
+ * True when the branch already carries LLM context: any session entry that
+ * produces context messages (a message, a compaction summary, …). A
+ * mid-session system-prompt change in that case would invalidate the whole
+ * KV-cache prefix and make the local model re-read the entire session.
+ */
 function branchHasContext(ctx: ExtensionContext): boolean {
   const branch = ctx.sessionManager.getBranch();
   return branch.some(
@@ -604,6 +615,19 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       const id = itemId(plan, idx) ?? String(idx + 1);
+      if (epistemeMode === "strict") {
+        // Strict mode: unreported items belong to a GVS run. Queuing "go do
+        // this item" here would push the main agent to grind the plan out by
+        // hand — exactly what strict instructions tell it not to do — and
+        // auto-starting a multi-session, tool-using run would spend money
+        // nobody asked for. So strict mode reports what is left and stops.
+        if (ctx.hasUI)
+          ctx.ui.notify(
+            `pi-episteme: plan item ${id} is still unreported. In strict mode continue it with /episteme-orchestrate or episteme(action="orchestrate") — or advance manually if you are finishing it yourself.`,
+            "info",
+          );
+        return;
+      }
       pi.sendUserMessage(buildContinueMessage(id, itemText(plan, idx) ?? ""));
     } catch {
       // The user can continue manually if the host rejects a queued message.
@@ -670,6 +694,14 @@ export default function (pi: ExtensionAPI) {
     if (!enabled)
       return toolText(
         "Error: pi-episteme is disabled. Run /episteme-on to enable it for this session, then orchestrate again.",
+        true,
+      );
+    // GVS IS what strict mode means. In light mode the session's own agent runs
+    // the plan (the pi-strata behaviour), and an unannounced multi-session run
+    // with tool permissions would start under it.
+    if (epistemeMode !== "strict")
+      return toolText(
+        "Error: GVS orchestration is strict-mode only — in light mode this agent executes the plan itself. Run /episteme-on strict for this session, then orchestrate again.",
         true,
       );
     const model = ctx.model;
@@ -1158,7 +1190,10 @@ export default function (pi: ExtensionAPI) {
         }
         updateWidget(ctx);
         if (ctx.hasUI)
-          ctx.ui.notify(`pi-episteme: switched to ${epistemeMode} mode`, "info");
+          ctx.ui.notify(
+            `pi-episteme: switched to ${epistemeMode} mode (${modeCapabilityLabel(epistemeMode)})`,
+            "info",
+          );
         return;
       }
       epistemeMode = requested;
@@ -1183,7 +1218,7 @@ export default function (pi: ExtensionAPI) {
       }
       if (ctx.hasUI)
         ctx.ui.notify(
-          `pi-episteme: ${epistemeMode} mode enabled${deferSystemPrompt ? " — standing instructions queued; the system prompt changes after the next compaction" : ""}.${hasLayers ? ` ${statusText(ctx)}` : ""}`,
+          `pi-episteme: ${epistemeMode} mode enabled (${modeCapabilityLabel(epistemeMode)})${deferSystemPrompt ? " — standing instructions queued; the system prompt changes after the next compaction" : ""}.${hasLayers ? ` ${statusText(ctx)}` : ""}`,
           "info",
         );
     },
