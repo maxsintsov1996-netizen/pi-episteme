@@ -46,7 +46,6 @@ import {
 import {
   readOrchFixRounds,
   runOrchestration,
-  type OrchestrationOutcome,
 } from "./orchestrator.ts";
 import {
   SEP,
@@ -66,20 +65,24 @@ import {
   planChangeError,
   planDashboardSegments,
   planIdError,
+  pruneStaleDirs,
   reportPlanCounts,
   epistemePaths,
   stripEpistemeMarkersForDisplay,
   type EpistemeLayers,
   type WidgetSegment,
 } from "./episteme.ts";
-
-/**
- * customType of the standing-instructions message injected by /episteme-on in
- * a session that already carries context (KV-cache guard: the system prompt
- * must not change mid-session, so the layer-0 instructions ride on a message
- * appended at the end of the context until the next compaction).
- */
-const INSTRUCTIONS_CUSTOM_TYPE = "episteme-instructions";
+import {
+  buildContinueMessage,
+  buildEpistemeActivationMessage,
+  buildEpistemeInstructions,
+  buildEpistemeModeSwitchMessage,
+  buildEpistemeRevocationMessage,
+  buildOrchestrationPersistRequest,
+  formatOrchestrationOutcome,
+  INSTRUCTIONS_CUSTOM_TYPE,
+  type EpistemeMode,
+} from "./prompts.ts";
 
 interface ToolResult {
   content: { type: "text"; text: string }[];
@@ -87,16 +90,106 @@ interface ToolResult {
   isError?: boolean;
 }
 
-/** Render the orchestration result for the tool result / the TUI. */
-function formatOrchestrationOutcome(outcome: OrchestrationOutcome): string {
-  const lines = [
-    `Orchestration ${outcome.ok ? "PASSED" : "FAILED"}: ${outcome.summary}`,
-    `completed steps: [${outcome.completed.join(",")}]`,
-  ];
-  if (outcome.rounds > 0) lines.push(`corrective rounds: ${outcome.rounds}`);
-  if (outcome.issues.length > 0)
-    lines.push(`open issues:\n${outcome.issues.map((i) => `- ${i}`).join("\n")}`);
-  return lines.join("\n");
+/**
+ * Worker tools that only observe the repository. Everything else (bash, edit,
+ * write, and anything a model can reach through them) needs the user's OK, just
+ * like it would in their own session.
+ */
+const WORKER_READ_ONLY_TOOLS = new Set([
+  "read",
+  "grep",
+  "glob",
+  "ls",
+  "find",
+  "search",
+  "webfetch",
+]);
+
+/** How long an ephemeral-session episteme dir may sit before it is pruned. */
+const EPHEMERAL_DIR_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * pi exposes no typed cancellation error for a rejected compaction: it throws
+ * Error("Compaction cancelled") from its own layer and AbortError from the
+ * transport. Both shapes have to be recognised, and the match stays textual
+ * because there is nothing better to match on upstream.
+ */
+function isCancellation(err: unknown): boolean {
+  if (err instanceof Error && err.name === "AbortError") return true;
+  const message = err instanceof Error ? err.message : String(err);
+  return /cancel/i.test(message);
+}
+
+/** Mutable per-run state shared with the worker approval bridge. */
+interface WorkerApprovalState {
+  approvedAll: boolean;
+  announcedNoUI: boolean;
+}
+
+/**
+ * Tool-approval bridge for orchestration worker sessions.
+ *
+ * Workers load with `noExtensions` so a run cannot recurse back into
+ * pi-episteme. In pi, though, tool permission IS an extension (a `tool_call`
+ * handler), so loading no extensions would also drop the user's own approval
+ * policy and let a Worker run bash/edit/write in the real working tree
+ * unasked. This bridge re-attaches exactly that one concern: every
+ * non-read-only worker tool call is confirmed on the PARENT session's UI, with
+ * an "allow all for this run" escape hatch. It registers no tools, commands or
+ * events beyond this handler, so it cannot recurse.
+ */
+export function workerApprovalBridge(
+  parent: ExtensionContext,
+  state: WorkerApprovalState,
+) {
+  return (api: ExtensionAPI): void => {
+    api.on("tool_call", async (event) => {
+      // SAFETY: every ToolCallEvent variant of the pi union carries a string
+      // toolName and an input object; the union is not narrowed here because
+      // this handler is generic over all tool names.
+      const toolName = String(
+        (event as unknown as { toolName?: unknown }).toolName ?? "?",
+      );
+      if (WORKER_READ_ONLY_TOOLS.has(toolName)) return undefined;
+      if (state.approvedAll) return undefined;
+      if (!parent.hasUI) {
+        // Headless: nobody to ask. Say so once instead of failing silently —
+        // the alternative is an unattended run the user believes is gated.
+        if (!state.announcedNoUI) {
+          state.announcedNoUI = true;
+          try {
+            parent.ui.notify(
+              "pi-episteme: no interactive UI available — orchestration workers run unattended (tool approvals disabled).",
+              "warning",
+            );
+          } catch {
+            // UI-less hosts may drop notifications; approval stays impossible.
+          }
+        }
+        return undefined;
+      }
+      // SAFETY: see the toolName cast above — input is always a JSON object.
+      const preview = JSON.stringify(
+        (event as unknown as { input?: unknown }).input ?? {},
+      ).slice(0, 400);
+      const choice = await parent.ui.select(
+        `pi-episteme worker wants to use ${toolName}`,
+        [
+          `Allow once — ${preview}`,
+          "Allow all tools for this run",
+          "Block this call",
+        ],
+      );
+      if (choice === undefined || choice.startsWith("Block"))
+        return {
+          block: true,
+          reason:
+            "Blocked by the user at the pi-episteme worker approval prompt.",
+        };
+      if (choice.startsWith("Allow all")) state.approvedAll = true;
+      return undefined;
+    });
+  };
 }
 
 const toolText = (text: string, isError = false): ToolResult => ({
@@ -113,73 +206,36 @@ function resolveEpistemeDir(ctx: ExtensionContext): string {
   return join(getAgentDir(), "episteme", sm.getSessionId());
 }
 
-/** Static per-session instructions appended to the system prompt (layer 0). */
-export function buildEpistemeInstructions(
-  epistemeDir: string,
-  mode: "strict" | "light" = "light",
-): string {
-  const p = epistemePaths(epistemeDir);
-  const activation =
-    mode === "light"
-      ? "Light mode: answer questions and complete small tasks normally, without markers. Start the full pipeline below only when a task is substantial enough to benefit from phased context."
-      : "Strict mode: use the pipeline below for every implementation task. For questions, clarification, or discussion without a task, just answer without markers.";
-  return `## PI-EPISTEME — layered context (KV-cache optimization)
-
-You work with a layered context: [system] → [research] → [plan] → [milestones] → [step reports] → [plan delta]. Ephemeral work is appended at the end and a phase-boundary compaction is requested after every advance. Small sessions can remain temporarily uncompacted when the host pi does not support forced compaction; keep following the protocol.
-
-${activation}
-
-Write each phase between exact markers. The last occurrence of a block wins. A new RESEARCH starts a new task cycle and clears the previous PLAN, PLAN-DELTA, STEP, and MILESTONE layers. Never rely on a previous cycle's reports.
-
-Markers:
-- research: /*EPISTEME::RESEARCH::v1*/ … /*EPISTEME::END::RESEARCH::v1*/
-- base plan: /*EPISTEME::PLAN::v1*/ … /*EPISTEME::END::PLAN::v1*/
-- step ID report: /*EPISTEME::STEP-ID::v1*/ … /*EPISTEME::END::STEP-ID::v1*/
-- plan update: /*EPISTEME::PLAN-DELTA::v1*/ … /*EPISTEME::END::PLAN-DELTA::v1*/
-
-Pipeline:
-1. Clarify the requirements until the task is pinned down.
-2. Write RESEARCH: begin with the user's goal, outcome, and explicit constraints; then record stack, architecture, inputs, and acceptance criteria.
-3. Write PLAN with one self-contained item per line in the format "- [id:S1] action". IDs are unique and stable (S1, S2, … or meaningful short IDs). Include files/modules, exact actions, verification commands, and expected outcomes. Call episteme(action="advance") after writing a new RESEARCH and its new base PLAN.
-4. Execute one item at a time. After its code and checks, write a 10–30 line STEP-ID report: work done, files, verification results, decisions, and risks. Call episteme(action="advance", step="ID"). The raw context is saved to ${p.tmp}/step_ID_raw.md when phase compaction succeeds; mention that path in the report.
-5. Reports and MILESTONE digests are the information store for later steps. Do not omit key facts.
-
-Rules:
-- Do not re-emit PLAN to tick checkboxes. Progress comes from STEP and MILESTONE completion records.
-- To change the current plan, write PLAN-DELTA containing the FULL new effective plan with the same IDs for existing items. Completed item IDs and their action text are immutable. Add new work under fresh IDs.
-- A new RESEARCH must be followed by a new base PLAN before advance is accepted; a previous plan is not inherited.
-- Close every block before calling advance. Unclosed or empty blocks are dropped.
-- Do not hand-edit the generated summary after compaction.`;
-}
-
 /**
  * True when the branch already carries LLM context: any session entry that
  * produces context messages (a message, a compaction summary, …). A
  * mid-session system-prompt change in that case would invalidate the whole
  * KV-cache prefix and make the local model re-read the entire session.
  */
+/** The system-prompt state line in `/episteme` status. */
+export function syspromptStateLabel(
+  enabled: boolean,
+  deferred: boolean,
+): string {
+  if (!enabled) return "inactive";
+  return deferred ? "deferred (next compaction)" : "active";
+}
+
+/** "step:S1, + pi summary, epoch 2" — the compaction notification suffix. */
+export function compactionLabel(ep: EpistemeDetails["episteme"]): string {
+  const parts: string[] = [ep.mode];
+  if (ep.llmSummary) parts.push("+ pi summary");
+  else if (ep.rawFallback) parts.push("+ raw fallback");
+  if (ep.epoch) parts.push(`epoch ${ep.epoch}`);
+  if (ep.dedupedWithTail?.length)
+    parts.push(`-${ep.dedupedWithTail.length} dup with tail`);
+  return parts.join(", ");
+}
+
 function branchHasContext(ctx: ExtensionContext): boolean {
   const branch = ctx.sessionManager.getBranch();
   return branch.some(
     (entry) => sessionEntryToContextMessages(entry as never).length > 0,
-  );
-}
-
-/**
- * The standing instructions delivered by /episteme-on in a session that already
- * has context: a short activation notice plus the exact layer-0 body (kept
- * byte-identical to buildEpistemeInstructions, so after the system prompt picks
- * the instructions up the model sees the same protocol it followed before).
- */
-export function buildEpistemeActivationMessage(
-  epistemeDir: string,
-  mode: "strict" | "light",
-): string {
-  return (
-    `[pi-episteme] Layered-context ${mode} mode is now ON for this session. ` +
-    "The standing instructions below apply until /episteme-off; after the next " +
-    `compaction they move into the system prompt and this message is dropped.\n\n` +
-    buildEpistemeInstructions(epistemeDir, mode)
   );
 }
 
@@ -375,7 +431,7 @@ export default function (pi: ExtensionAPI) {
     layerTokenBudget: initial.layerTokenBudget,
   };
   let enabled = false;
-  let epistemeMode: "strict" | "light" = "light";
+  let epistemeMode: EpistemeMode = "light";
   let paused = false;
   let deferSystemPrompt = false;
   let autoContinue = initial.autoContinue;
@@ -383,7 +439,9 @@ export default function (pi: ExtensionAPI) {
   let compactOurs = false;
   let deferredReason: string | undefined;
   const stats = { compacted: 0, deferred: 0 };
-  let orchestrationActive = false;
+  /** The live orchestration's abort handle — /episteme abort and shutdown use it
+   *  because a command handler gets no operation signal from pi. */
+  let activeOrchAbort: AbortController | null = null;
   rt.ensureBoundary = (ctx) => {
     pi.appendEntry("episteme-phase-boundary", {
       kind: rt.pending?.kind,
@@ -464,7 +522,7 @@ export default function (pi: ExtensionAPI) {
     return [
       `dir: ${dir}`,
       `mode: ${enabled ? epistemeMode : "off"}${paused ? " (paused)" : ""}`,
-      `sysprompt: ${!enabled ? "inactive" : deferSystemPrompt ? "deferred (next compaction)" : "active"}`,
+      `sysprompt: ${syspromptStateLabel(enabled, deferSystemPrompt)}`,
       `research: ${layers?.research ? "yes" : "no"}`,
       `plan: ${counts.done}/${counts.total} (${next})`,
       `reports: [${reports.map((r) => r.key).join(",")}]`,
@@ -545,9 +603,8 @@ export default function (pi: ExtensionAPI) {
           ctx.ui.notify("pi-episteme: all plan steps completed", "info");
         return;
       }
-      pi.sendUserMessage(
-        `PI-EPISTEME: continue — execute ${itemId(plan, idx)}: "${itemText(plan, idx)}".`,
-      );
+      const id = itemId(plan, idx) ?? String(idx + 1);
+      pi.sendUserMessage(buildContinueMessage(id, itemText(plan, idx) ?? ""));
     } catch {
       // The user can continue manually if the host rejects a queued message.
     }
@@ -569,8 +626,20 @@ export default function (pi: ExtensionAPI) {
         onDone?.();
       },
       onError: (err) => {
+        const cancelled = isCancellation(err);
+        if (cancelled && rt.pending) {
+          // Keep the phase request: the boundary entry already exists, so the
+          // next agent_settled retries the compaction instead of silently
+          // dropping a phase the user cancelled by pressing Esc once.
+          if (ctx.hasUI)
+            ctx.ui.notify(
+              "pi-episteme: compaction cancelled; the phase boundary is kept and retried at the next advance",
+              "info",
+            );
+          return;
+        }
         rt.pending = null;
-        if (continueOnError && err.message !== "Compaction cancelled") {
+        if (continueOnError && !cancelled) {
           deferredReason = err.message;
           stats.deferred += 1;
           if (ctx.hasUI)
@@ -593,11 +662,31 @@ export default function (pi: ExtensionAPI) {
     ctx: ExtensionContext,
     toolSignal?: AbortSignal,
   ): Promise<ToolResult> => {
-    if (orchestrationActive)
+    if (activeOrchAbort)
       return toolText("Error: an orchestration is already running.", true);
+    // Same gate as `advance`: orchestration writes EPISTEME layers into this
+    // session, and with the mode off no episteme compaction would ever fold
+    // them — pi's default summarizer would swallow them as prose.
+    if (!enabled)
+      return toolText(
+        "Error: pi-episteme is disabled. Run /episteme-on to enable it for this session, then orchestrate again.",
+        true,
+      );
     const model = ctx.model;
     if (!model) return toolText("Error: no model selected.", true);
-    orchestrationActive = true;
+    // pi gives a command handler no operation signal, so the run owns its own
+    // abort handle: /episteme abort and session_shutdown drive it.
+    const abort = new AbortController();
+    activeOrchAbort = abort;
+    const approval: WorkerApprovalState = {
+      approvedAll: false,
+      announcedNoUI: false,
+    };
+    const signal = toolSignal ?? ctx.signal ?? abort.signal;
+    if (signal !== abort.signal) {
+      // Forward the host signal (tool cancellation) into our own handle.
+      signal.addEventListener("abort", () => abort.abort(), { once: true });
+    }
     const notify = (phase: string): void => {
       if (ctx.hasUI)
         ctx.ui.notify(`pi-episteme orchestration: ${phase}`, "info");
@@ -637,10 +726,14 @@ export default function (pi: ExtensionAPI) {
               .join("\n");
           },
           // Tool-using round (Worker / Verifier): an independent in-memory
-          // agent session. No extensions/skills/templates are loaded into the
-          // worker (noExtensions) so the run cannot recurse into pi-episteme;
-          // the byte-stable prefix becomes the worker system prompt.
-          runAgent: async (call, signal) => {
+          // agent session. noExtensions keeps the run from recursing into
+          // pi-episteme (and keeps skills/templates/themes out of the
+          // byte-stable prefix); the one extension capability it must not lose
+          // is tool permission, so the approval bridge is re-attached inline.
+          // Context files (AGENTS.md) stay ON: a worker editing this repo has
+          // to see its conventions, and they are identical across roles, so the
+          // prefix bytes still line up.
+          runAgent: async (call, agentSignal) => {
             const loader = new DefaultResourceLoader({
               cwd: ctx.cwd,
               agentDir: getAgentDir(),
@@ -648,7 +741,13 @@ export default function (pi: ExtensionAPI) {
               noSkills: true,
               noPromptTemplates: true,
               noThemes: true,
-              noContextFiles: true,
+              extensionFactories: [
+                {
+                  name: "pi-episteme-worker-approval",
+                  factory: workerApprovalBridge(ctx, approval),
+                  hidden: true,
+                },
+              ],
               systemPrompt: call.systemPrompt,
             });
             await loader.reload();
@@ -664,19 +763,19 @@ export default function (pi: ExtensionAPI) {
             const onAbort = (): void => {
               void session.abort();
             };
-            signal?.addEventListener("abort", onAbort);
+            agentSignal?.addEventListener("abort", onAbort);
             try {
               await session.prompt(call.message);
               return session.getLastAssistantText() ?? "";
             } finally {
-              signal?.removeEventListener("abort", onAbort);
+              agentSignal?.removeEventListener("abort", onAbort);
               session.dispose();
             }
           },
         },
         {
           maxFixRounds: readOrchFixRounds(),
-          signal: toolSignal ?? ctx.signal ?? undefined,
+          signal: abort.signal,
           onPhase: notify,
         },
       );
@@ -686,13 +785,7 @@ export default function (pi: ExtensionAPI) {
       const blocks = buildEpistemeSummary(outcome.layers);
       if (blocks.includes("EPISTEME::")) {
         try {
-          pi.sendUserMessage(
-            `PI-EPISTEME: orchestration ${outcome.ok ? "succeeded" : "finished with failures"}. ` +
-              "Persist the run state: emit the canonical blocks below verbatim as your next assistant message " +
-              "(marker blocks exactly as shown, no code fences), so the layers become the durable state of this session. " +
-              "Then briefly report the result to the user.\n\n" +
-              blocks,
-          );
+          pi.sendUserMessage(buildOrchestrationPersistRequest(outcome, blocks));
         } catch {
           // Queuing can fail in headless shutdown; the outcome text below
           // still carries the full report.
@@ -705,7 +798,7 @@ export default function (pi: ExtensionAPI) {
         true,
       );
     } finally {
-      orchestrationActive = false;
+      activeOrchAbort = null;
     }
   };
 
@@ -722,6 +815,8 @@ export default function (pi: ExtensionAPI) {
     autoContinue = s.autoContinue;
     hideAnchors = s.hideAnchors;
 
+    activeOrchAbort?.abort();
+    activeOrchAbort = null;
     rt.epistemeDir = resolveEpistemeDir(ctx);
     rt.pending = null;
     rt.layerTokenBudget = s.layerTokenBudget;
@@ -729,6 +824,21 @@ export default function (pi: ExtensionAPI) {
     deferredReason = undefined;
     stats.compacted = 0;
     stats.deferred = 0;
+
+    // Sessions without a session file (in-memory/ephemeral hosts) put their
+    // episteme dir under <agentDir>/episteme/<id>, where there is no .jsonl to
+    // match against — prune those by age instead of leaking them forever.
+    if (!ctx.sessionManager.getSessionFile()) {
+      const stale = pruneStaleDirs(
+        join(getAgentDir(), "episteme"),
+        EPHEMERAL_DIR_MAX_AGE_MS,
+      );
+      if (stale > 0 && ctx.hasUI)
+        ctx.ui.notify(
+          `pi-episteme: removed stale ephemeral episteme dirs: ${stale}`,
+          "info",
+        );
+    }
 
     // pi fires no "session deleted" event: collect orphaned episteme dirs of
     // sessions whose .jsonl is gone (session picker or manual deletion).
@@ -779,6 +889,10 @@ export default function (pi: ExtensionAPI) {
     // Compaction can also be the first event after `/reload` (for example an
     // automatic overflow compaction), before another agent turn has started.
     if (!rt.epistemeDir) rt.epistemeDir = resolveEpistemeDir(ctx);
+    // Reset before any early return: a stale true here would make the next
+    // session_compact claim our summary was replaced when we never produced one
+    // (e.g. the very first compaction after /episteme-off).
+    compactOurs = false;
     if (!enabled) {
       // Disabled: fall back to pi's default compaction. Drop any stale
       // phase request so it cannot be consumed by a later compaction.
@@ -817,6 +931,15 @@ export default function (pi: ExtensionAPI) {
     requestCompact(ctx, label, continueNext, true);
   });
 
+  // A run of independent tool-using agent sessions must not outlive the session
+  // that started it: pi gives a command handler no signal, so shutdown is the
+  // one guaranteed hook that can stop it.
+  pi.on("session_shutdown", () => {
+    if (!activeOrchAbort) return;
+    activeOrchAbort.abort();
+    activeOrchAbort = null;
+  });
+
   // The plan/reports live in the conversation, so every finished turn (and
   // every compaction) can change what the dashboard shows.
   pi.on("turn_end", (_event, ctx) => {
@@ -845,13 +968,7 @@ export default function (pi: ExtensionAPI) {
     if (!ctx.hasUI) return;
     if (details?.episteme) {
       ctx.ui.notify(
-        `pi-episteme: layers compacted (${details.episteme.mode}${
-          details.episteme.llmSummary
-            ? ", + pi summary"
-            : details.episteme.rawFallback
-              ? ", + raw fallback"
-              : ""
-        }${details.episteme.epoch ? `, epoch ${details.episteme.epoch}` : ""})`,
+        `pi-episteme: layers compacted (${compactionLabel(details.episteme)})`,
         "info",
       );
     } else if (compactOurs) {
@@ -942,7 +1059,7 @@ export default function (pi: ExtensionAPI) {
 
   pi.registerCommand("episteme", {
     description:
-      "pi-episteme: status/stats; compact; pause/resume auto-continue; reset snapshots; /episteme-on [strict|light]; /episteme-off",
+      "pi-episteme: status/stats; compact; pause/resume auto-continue; abort a running orchestration; reset snapshots; /episteme-on [strict|light]; /episteme-off",
     handler: async (args, ctx) => {
       const cmd = (args ?? "").trim().toLowerCase();
       if (cmd === "compact") {
@@ -964,14 +1081,34 @@ export default function (pi: ExtensionAPI) {
         }
         return;
       }
+      if (cmd === "abort" || cmd === "cancel") {
+        if (!activeOrchAbort) {
+          ctx.ui.notify("pi-episteme: no orchestration is running", "info");
+          return;
+        }
+        activeOrchAbort.abort();
+        activeOrchAbort = null;
+        ctx.ui.notify(
+          "pi-episteme: orchestration abort requested — finishing the current call, then stopping",
+          "info",
+        );
+        return;
+      }
       if (cmd !== "reset") {
+        if (cmd !== "")
+          ctx.ui.notify(
+            `pi-episteme: unknown subcommand "${cmd}" — showing status (known: compact, pause, resume, abort, reset)`,
+            "warning",
+          );
         ctx.ui.notify(`pi-episteme: ${statusText(ctx)}`, "info");
         updateWidget(ctx);
         return;
       }
-      if (!ctx.hasUI || !rt.epistemeDir) {
-        if (ctx.hasUI)
-          ctx.ui.notify("pi-episteme: reset requires a session and interactive mode", "error");
+      if (!rt.epistemeDir || !ctx.hasUI) {
+        ctx.ui.notify(
+          "pi-episteme: reset needs a session and an interactive UI (confirm dialog)",
+          "error",
+        );
         return;
       }
       const ok = await ctx.ui.confirm(
@@ -1009,11 +1146,11 @@ export default function (pi: ExtensionAPI) {
           pi.sendMessage(
             {
               customType: INSTRUCTIONS_CUSTOM_TYPE,
-              content:
-                `[pi-episteme] Mode switched: ${previous} → ${epistemeMode}. ` +
-                "The standing instructions below supersede the earlier activation; " +
-                "the previous set no longer applies.\n\n" +
-                buildEpistemeActivationMessage(rt.epistemeDir, epistemeMode),
+              content: buildEpistemeModeSwitchMessage(
+                rt.epistemeDir,
+                previous,
+                epistemeMode,
+              ),
               display: true,
             },
             { deliverAs: "nextTurn" },
@@ -1069,8 +1206,7 @@ export default function (pi: ExtensionAPI) {
         pi.sendMessage(
           {
             customType: INSTRUCTIONS_CUSTOM_TYPE,
-            content:
-              "[pi-episteme] Layered-context mode is now OFF. Previous standing pi-episteme instructions are revoked; do not emit new EPISTEME blocks or call advance unless the user explicitly enables the mode again.",
+            content: buildEpistemeRevocationMessage(),
             display: true,
           },
           { deliverAs: "nextTurn" },

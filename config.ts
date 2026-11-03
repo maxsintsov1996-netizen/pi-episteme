@@ -151,7 +151,9 @@ function resolveLayerTokenBudget(cfgBudget: number | undefined): number {
  const envBudget = envValue(ENV.layerTokenBudget)?.trim();
  if (envBudget !== undefined && /^\d+$/.test(envBudget)) {
   const value = Number(envBudget);
-  if (Number.isFinite(value) && Number.isInteger(value)) {
+  // Safe-integer, not just integer: "99999999999999999999" is an integer
+  // (1e20) and would silently act as "rollover disabled".
+  if (Number.isSafeInteger(value)) {
    return value;
   }
  }

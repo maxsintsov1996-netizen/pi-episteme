@@ -24,6 +24,7 @@ import {
   buildMilestoneText,
   buildEpistemeSummary,
   completedStepIds,
+  epistemeSummaryBlocks,
   estimateTextTokens,
   extractLayers,
   normalizeText,
@@ -64,6 +65,9 @@ export interface EpistemeDetails {
     llmSummary: boolean;
     rawFallback: boolean;
     epoch?: number;
+    /** Layer blocks left out of the summary because the retained tail already
+     *  carries them byte-identically (no point paying for them twice). */
+    dedupedWithTail?: string[];
   };
 }
 
@@ -237,6 +241,33 @@ function previousCanonicalSummary(summary: string | undefined): string | undefin
   return canonical;
 }
 
+/**
+ * Canonical summary for the compacted context. A layer block whose exact
+ * rendered form is still present in the messages pi is about to KEEP is left
+ * out of the summary: the model would otherwise read the same STEP report
+ * twice (once raw in the retained tail, once canonical in the summary). Only
+ * byte-identical copies are dropped, so nothing is ever lost — the next
+ * compaction folds the tail copy back into the canonical layers.
+ */
+function canonicalLayerSummary(
+  layers: EpistemeLayers,
+  keptText: string,
+): { summary: string; deduped: string[] } {
+  const kept = keptText ? normalizeText(keptText) : "";
+  const deduped: string[] = [];
+  const blocks = epistemeSummaryBlocks(layers).filter((b) => {
+    if (kept && kept.includes(b.block)) {
+      deduped.push(b.key);
+      return false;
+    }
+    return true;
+  });
+  return {
+    summary: [EPISTEME_MARKER, ...blocks.map((b) => b.block)].join(SEP),
+    deduped,
+  };
+}
+
 function fallbackCheckpoint(discardedSerialized: string): string | undefined {
   const clean = stripEpistemeBlocks(discardedSerialized);
   if (!clean) return undefined;
@@ -263,13 +294,16 @@ async function maybeRollover(
     return { layers: initial };
 
   const epoch = Math.max(0, ...(initial.milestones ?? []).map((m) => m.n)) + 1;
-  writeSnapshot(
-    join(epistemePaths(dir).tmp, `epoch_${epoch}_layers.md`),
-    `epoch ${epoch} layers`,
-    buildEpistemeSummary(initial),
-  );
   try {
     const digest = await summarize(initial, preparation, ctx, signal);
+    // Archive the pre-rollover layers only once the rollover actually happened
+    // — a failed summarization keeps the full reports in the layers, and a
+    // stray epoch_N file would describe an epoch that never existed.
+    writeSnapshot(
+      join(epistemePaths(dir).tmp, `epoch_${epoch}_layers.md`),
+      `epoch ${epoch} layers`,
+      buildEpistemeSummary(initial),
+    );
     const completed = completedStepIds(reports, initial.milestones ?? []);
     const milestone = {
       n: epoch,
@@ -400,7 +434,10 @@ export async function handleSessionBeforeCompact(
     }
   }
 
-  const epistemeSummary = buildEpistemeSummary(layers);
+  const { summary: epistemeSummary, deduped } = canonicalLayerSummary(
+    layers,
+    assistantText(keptMessages).join(SEP),
+  );
   const tail = llm
     ? normalizeText(llm.summary)
     : rawFallback
@@ -420,6 +457,7 @@ export async function handleSessionBeforeCompact(
       llmSummary: llm !== undefined,
       rawFallback,
       epoch: rollover.epoch,
+      dedupedWithTail: deduped.length > 0 ? deduped : undefined,
     },
   };
 

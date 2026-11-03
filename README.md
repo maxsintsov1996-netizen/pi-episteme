@@ -50,6 +50,13 @@ A plan item uses a stable, unique ID:
 - [id:S1] Update src/example.ts, run npm test, and record the expected result
 ```
 
+PLAN and PLAN-DELTA are **flat lists**: one item per top-level bullet, starting
+at column 0. Indented sub-bullets, prose lines and lines inside a code fence are
+not items — every tracked item must eventually carry a STEP report, so a nested
+plan would create items that can never be reported on. Put detail in the item
+text or in RESEARCH; an indented plain-text line is read as a continuation of
+the item above it.
+
 Its report is `STEP-S1`, between
 `/*EPISTEME::STEP-S1::v1*/` and `/*EPISTEME::END::STEP-S1::v1*/`.
 Existing sessions with numeric `STEP-N` reports remain readable, and the tool
@@ -88,7 +95,10 @@ base PLAN is required before `advance` is accepted.
 5. Other enabled-session compactions (overflow or `/episteme compact`) use plain
    mode. They keep pi's normal retained tail, filter episteme layers out of the
    plain summarizer's input, and append its ephemeral-work summary after the
-   canonical layers. New markers are trusted only in assistant text and a
+   canonical layers. A layer block whose exact text is still present in the
+   retained tail is left out of the summary rather than paid for twice
+   (`dedupedWithTail` in the compaction details records which); nothing is lost —
+   the next compaction folds the tail copy back into the canonical layers. New markers are trusted only in assistant text and a
    previous canonical episteme summary, not in user/tool text. If plain LLM
    summarization fails, pi-episteme adds a bounded raw checkpoint (the last
    12,000 characters of cleaned discarded context) instead of losing the
@@ -108,19 +118,38 @@ Resumed sessions also start off, with a notice if existing layers are found.
 ## Orchestration (Stage 1)
 
 For complex tasks, `episteme(action="orchestrate", task="…")` (or
-`/episteme-orchestrate <task>`) runs the pipeline:
+`/episteme-orchestrate <task>`) runs the pipeline. Like `advance`, it requires an
+enabled session (`/episteme-on`): orchestration writes Episteme layers, and with
+the mode off pi's default summarizer would swallow them:
 
 1. **Manager** (chat-only model call) writes RESEARCH and a base PLAN in
    Episteme marker blocks. Malformed plans are fed back once for a retry.
 2. **Workers** execute plan items strictly in order — one independent,
-   in-memory agent session per item (`noExtensions`, default coding tools,
-   fresh context each time). A Worker ends with a STEP-ID report; without a
-   marker block its final message is kept as the report.
+   in-memory agent session per item (default coding tools, fresh context each
+   time). A Worker ends with a STEP-ID report; without a marker block its final
+   message is kept as the report.
+
+   Workers load with `noExtensions` so a run cannot recurse into pi-episteme.
+   In pi, tool permission is itself an extension, so pi-episteme re-attaches
+   exactly that one concern as an inline extension: every non-read-only worker
+   tool call (bash, edit, write, …) is confirmed on the **parent** session's UI,
+   with "allow once", "allow all for this run" and "block". Project context
+   files (AGENTS.md) are loaded into workers — they edit this repository and
+   must see its conventions, and they are identical across roles, so the
+   byte-stable prefix is unaffected. In a headless session there is nobody to
+   ask: workers run unattended and pi-episteme says so once, explicitly.
 3. **Verifier** (independent agent session) re-runs the plan's verification
    commands and replies with a single JSON verdict. On failure the Manager
    issues a PLAN-DELTA with corrective items under fresh IDs (completed items
    are immutable and never re-executed); the number of corrective rounds is
-   bounded by `PI_EPISTEME_ORCH_FIX_ROUNDS` (default 2).
+   bounded by `PI_EPISTEME_ORCH_FIX_ROUNDS` (default 2, hard ceiling 10 — each
+   round re-runs outstanding items against the real working tree).
+
+   A run of independent tool-using sessions must be stoppable: `/episteme abort`
+   aborts the live run, and session shutdown aborts it too. A command handler
+   gets no operation signal from pi, so `/episteme-orchestrate` drives its own
+   AbortController; a run started through the tool also honours the tool's own
+   cancel signal.
 4. On completion the orchestrator queues a persist request asking the main
    agent to re-emit the canonical blocks as its own assistant text, so the run
    state survives compaction in this session. **No orchestration state is
@@ -172,19 +201,24 @@ neither proves that a KV-cache hit occurred.
 ## Installation
 
 ```bash
-pi install npm:pi-episteme
-# or from git (pinned ref):
-pi install git:github.com/maxsintsov1996-netizen/pi-episteme@v0.1.0
+# from git (pinned ref):
+pi install git:github.com/maxsintsov1996-netizen/pi-episteme@v0.2.0
 # or from a local checkout:
 pi install /path/to/pi-episteme
 ```
+
+> npm: `pi install npm:pi-episteme` works once v0.2.0 is published to the
+> registry. The npm release had not been published at the time of writing —
+> `npm view pi-episteme` answers 404 — so git/local install is the documented
+> path.
 
 Node.js **22.19.0 or newer** is required. TypeScript is loaded by pi; there is
 no build step.
 
 The package declares these peer dependencies: `@earendil-works/pi-ai`,
-`@earendil-works/pi-coding-agent`, `@earendil-works/pi-tui`, and `typebox`.
-Development dependencies are `@types/node` and `typescript`. The optional local
+`@earendil-works/pi-coding-agent` and `@earendil-works/pi-tui` (all `>=0.85.0`,
+the line this extension is developed and tested against), and `typebox`
+(`>=1.0.0`). Development dependencies are `@types/node` and `typescript`. The optional local
 smoke script uses Node's built-in `fetch`, `URL`, and `performance` APIs and
 adds no runtime package dependency.
 
@@ -200,7 +234,9 @@ adds no runtime package dependency.
 - `episteme(action="orchestrate", task="…")` — run the file-less
   Manager → Worker → Verifier pipeline for a complex task.
 - `/episteme` — show status; `/episteme compact` — request manual compaction;
-  `/episteme reset` — confirm and delete this session's raw snapshots.
+  `/episteme abort` — abort the running orchestration; `/episteme reset` —
+  confirm and delete this session's raw snapshots. An unknown subcommand says so
+  instead of silently showing status.
 - `/episteme pause` and `/episteme resume` — pause/resume auto-continue.
 - `/episteme-on [strict|light]` — enable the session in the selected mode
   (light by default; re-run with the other mode to switch).
@@ -219,8 +255,8 @@ default**. Invalid values fall through to the next source. Files are
 | --- | --- | --- | --- |
 | `PI_EPISTEME_AUTO_CONTINUE` | `piEpisteme.autoContinue` | `true` | Queue the next unfinished item after advance processing |
 | `PI_EPISTEME_HIDE_ANCHORS` | `piEpisteme.hideAnchors` | `true` | Hide marker anchors in the TUI only |
-| `PI_EPISTEME_LAYER_TOKEN_BUDGET` | `piEpisteme.layerTokenBudget` | `16384` | Estimated layer budget; `0` disables milestone rollover |
-| `PI_EPISTEME_ORCH_FIX_ROUNDS` | — | `2` | Orchestration corrective rounds after a failed verification |
+| `PI_EPISTEME_LAYER_TOKEN_BUDGET` | `piEpisteme.layerTokenBudget` | `16384` | Estimated layer budget; `0` disables milestone rollover (must be a safe integer) |
+| `PI_EPISTEME_ORCH_FIX_ROUNDS` | — | `2` | Orchestration corrective rounds after a failed verification (clamped to 10) |
 
 Boolean environment parsing is strict and case-insensitive after trimming:
 true values are `1`, `true`, `on`; false values are `0`, `false`, `off`.
@@ -244,6 +280,7 @@ Example:
 
 ```text
 index.ts        — session events, commands, tool, widgets, orchestration glue
+prompts.ts      — every model-facing text (layer-0 protocol, role/activation texts)
 compaction.ts   — plan/step/plain compaction, milestones, raw fallback
 episteme.ts     — markers, stable-ID plans, extraction, canonical summaries
 context.ts      — orchestration context builder (byte-stable prefix + role tails)
@@ -251,6 +288,7 @@ orchestrator.ts — Manager → Worker → Verifier loop (file-less, abortable)
 config.ts       — environment/settings resolution and defaults
 check.cjs       — offline self-tests
 local-check.cjs — optional OpenAI-compatible endpoint smoke check
+docs/design/    — historical design notes (pre-rename pi-strata → episteme)
 ```
 
 ```bash

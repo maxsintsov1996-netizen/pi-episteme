@@ -69,16 +69,23 @@ export interface OrchestrationOutcome {
 }
 
 const DEFAULT_FIX_ROUNDS = 2;
+/**
+ * Hard ceiling on corrective rounds. Each round re-runs every outstanding plan
+ * item plus a Verifier pass in a tool-using agent session; an unbounded env
+ * value would turn a typo into an unattended loop over the real working tree.
+ */
+export const MAX_FIX_ROUNDS = 10;
 
 /**
  * Corrective-round budget: env PI_EPISTEME_ORCH_FIX_ROUNDS (non-negative
- * integer) over the default. Kept env-only — a rarely tuned knob.
+ * integer, clamped to MAX_FIX_ROUNDS) over the default. Kept env-only — a
+ * rarely tuned knob.
  */
 export function readOrchFixRounds(): number {
   const raw = process.env.PI_EPISTEME_ORCH_FIX_ROUNDS?.trim();
   if (raw !== undefined && /^\d+$/.test(raw)) {
     const value = Number(raw);
-    if (Number.isSafeInteger(value)) return value;
+    if (Number.isSafeInteger(value)) return Math.min(value, MAX_FIX_ROUNDS);
   }
   return DEFAULT_FIX_ROUNDS;
 }
@@ -89,15 +96,6 @@ function throwIfAborted(signal?: AbortSignal): void {
 
 function assistantText(report: string): string {
   return report.trim();
-}
-
-/**
- * Pull the layers a Manager reply claims to define. Returns undefined when
- * the reply carries no usable blocks; the caller feeds the parse error back
- * to the Manager for one retry.
- */
-function managerLayers(text: string): EpistemeLayers | undefined {
-  return extractLayers(text);
 }
 
 /**
@@ -173,7 +171,10 @@ export async function runOrchestration(
   deps: OrchestratorDeps,
   options: OrchestratorOptions = {},
 ): Promise<OrchestrationOutcome> {
-  const maxFixRounds = Math.max(0, options.maxFixRounds ?? DEFAULT_FIX_ROUNDS);
+  const maxFixRounds = Math.min(
+    MAX_FIX_ROUNDS,
+    Math.max(0, options.maxFixRounds ?? DEFAULT_FIX_ROUNDS),
+  );
   const { signal, onPhase } = options;
   let layers: EpistemeLayers = { planFresh: false };
   let rounds = 0;
@@ -186,7 +187,7 @@ export async function runOrchestration(
     signal,
   );
   throwIfAborted(signal);
-  const planned = managerLayers(planText);
+  const planned = extractLayers(planText);
   const planError = planned ? validatePlan(planned) : "manager reply has no Episteme blocks";
   if (planError) {
     onPhase?.("manager:planning-retry");
@@ -198,7 +199,7 @@ export async function runOrchestration(
       signal,
     );
     throwIfAborted(signal);
-    const retried = managerLayers(retryText);
+    const retried = extractLayers(retryText);
     const retryError = retried ? validatePlan(retried) : "manager reply has no Episteme blocks";
     if (retryError)
       return {

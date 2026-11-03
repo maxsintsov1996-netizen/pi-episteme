@@ -17,6 +17,7 @@ import {
   mkdirSync,
   readdirSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
@@ -169,18 +170,32 @@ export function effectivePlan(layers: EpistemeLayers): string | undefined {
   return layers.planDelta ?? layers.plan;
 }
 
+/** The canonical blocks of a summary, in canonical order, rendered. */
+export interface EpistemeSummaryBlock {
+  key: string;
+  block: string;
+}
+
+export function epistemeSummaryBlocks(
+  layers: EpistemeLayers,
+): EpistemeSummaryBlock[] {
+  const out: EpistemeSummaryBlock[] = [];
+  const push = (key: string, body: string): void => {
+    out.push({ key, block: epistemeBlock(key, body) });
+  };
+  if (layers.research) push("RESEARCH", layers.research);
+  if (layers.plan) push("PLAN", layers.plan);
+  for (const m of layers.milestones ?? []) push(`MILESTONE-${m.n}`, m.text);
+  for (const r of layers.reports ?? []) push(`STEP-${r.key ?? String(r.n)}`, r.text);
+  if (layers.planDelta) push("PLAN-DELTA", layers.planDelta);
+  return out;
+}
+
 export function buildEpistemeSummary(layers: EpistemeLayers): string {
-  const out: string[] = [EPISTEME_MARKER];
-  if (layers.research) out.push(epistemeBlock("RESEARCH", layers.research));
-  if (layers.plan) out.push(epistemeBlock("PLAN", layers.plan));
-  for (const m of layers.milestones ?? [])
-    out.push(epistemeBlock(`MILESTONE-${m.n}`, m.text));
-  for (const r of layers.reports ?? []) {
-    const key = r.key ?? String(r.n);
-    out.push(epistemeBlock(`STEP-${key}`, r.text));
-  }
-  if (layers.planDelta) out.push(epistemeBlock("PLAN-DELTA", layers.planDelta));
-  return out.join(SEP);
+  return [
+    EPISTEME_MARKER,
+    ...epistemeSummaryBlocks(layers).map((b) => b.block),
+  ].join(SEP);
 }
 
 // ---------------------------------------------------------------------------
@@ -203,8 +218,15 @@ export function stripEpistemeMarkersForDisplay(md: string): string {
 // Plan and completion state
 // ---------------------------------------------------------------------------
 
+// An item is a TOP-LEVEL bullet only. The plan drives progress tracking, and
+// every item must eventually carry a STEP report: if indented sub-bullets or
+// lines inside a code fence became items, a model that nests its plan would
+// get phantom items it can never report on, and advance would deadlock.
 const PLAN_ITEM_RE =
-  /^\s*[-*+]\s+(?:\[([ xX])\]\s+)?(?:\[id:([A-Za-z0-9][A-Za-z0-9_-]*)\]\s+)?(.*)$/;
+  /^[-*+]+\s+(?:\[([ xX])\]\s+)?(?:\[id:([A-Za-z0-9][A-Za-z0-9_-]*)\]\s+)?(.*)$/;
+const FENCE_RE = /^\s*(?:```|~~~)/;
+const INDENTED_TEXT_RE = /^[ \t]+\S/;
+const INDENTED_BULLET_RE = /^[ \t]*[-*+]\s/;
 
 export interface PlanItem {
   id: string;
@@ -215,15 +237,29 @@ export interface PlanItem {
 
 export function parsePlan(md: string): PlanItem[] {
   const items: PlanItem[] = [];
+  let inFence = false;
   for (const line of md.split("\n")) {
-    const m = line.match(PLAN_ITEM_RE);
-    if (!m) continue;
-    items.push({
-      id: m[2] ?? String(items.length + 1),
-      text: m[3].trim(),
-      done: m[1]?.toLowerCase() === "x",
-      explicitId: m[2] !== undefined,
-    });
+    if (FENCE_RE.test(line)) {
+      inFence = !inFence;
+      continue;
+    }
+    if (inFence) continue;
+    const m = PLAN_ITEM_RE.exec(line);
+    if (m) {
+      items.push({
+        id: m[2] ?? String(items.length + 1),
+        text: m[3].trim(),
+        done: m[1]?.toLowerCase() === "x",
+        explicitId: m[2] !== undefined,
+      });
+      continue;
+    }
+    // An indented, non-bullet line is a soft wrap of the previous item.
+    if (!INDENTED_TEXT_RE.test(line) || INDENTED_BULLET_RE.test(line)) continue;
+    const last = items.at(-1);
+    const continuation = line.trim();
+    if (last && continuation)
+      last.text = `${last.text} ${continuation}`.trim();
   }
   return items;
 }
@@ -239,21 +275,12 @@ export function planIdError(md: string): string | null {
   return null;
 }
 
-export function firstUnchecked(md: string): number {
-  return parsePlan(md).findIndex((t) => !t.done);
-}
-
 export function itemText(md: string, index: number): string | undefined {
   return parsePlan(md)[index]?.text;
 }
 
 export function itemId(md: string, index: number): string | undefined {
   return parsePlan(md)[index]?.id;
-}
-
-export function planCounts(md: string): { done: number; total: number } {
-  const items = parsePlan(md);
-  return { done: items.filter((t) => t.done).length, total: items.length };
 }
 
 type ReportRef = { key?: string; n?: number };
@@ -463,6 +490,28 @@ export function cleanupOrphanedEpistemeDirs(sessionsDir: string): number {
     if (existsSync(join(sessionsDir, sessionFile))) continue;
     rmSync(join(sessionsDir, entry), { recursive: true, force: true });
     removed += 1;
+  }
+  return removed;
+}
+
+/**
+ * Prune age-old directories under `dir` (used for the ephemeral-session
+ * fallback root, which has no session file to be matched against). Directories
+ * newer than `maxAgeMs` are left alone.
+ */
+export function pruneStaleDirs(dir: string, maxAgeMs: number): number {
+  let removed = 0;
+  const now = Date.now();
+  for (const entry of readdirSyncSafe(dir)) {
+    const full = join(dir, entry);
+    try {
+      if (!statSync(full).isDirectory()) continue;
+      if (now - statSync(full).mtimeMs <= maxAgeMs) continue;
+      rmSync(full, { recursive: true, force: true });
+      removed += 1;
+    } catch {
+      // Unreadable or already gone: never fatal for a cleanup pass.
+    }
   }
   return removed;
 }

@@ -1,0 +1,33 @@
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # engines.node is >=22.19.0; 24 covers the current LTS line ahead of it.
+        node-version: ["22.19", "22.x", "24.x"]
+    steps:
+      # Pinned to full commit SHAs (tags are movable); no credentials are
+      # needed here, so the default workflow token is not persisted into logs.
+      - uses: actions/checkout@8ade135a41bc03ea155e62e844d188df1ea18608 # v4.1.0
+        with:
+          persist-credentials: false
+      # v4.1.0
+      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: npm
+      - name: Install (peer deps come from package-lock)
+        run: npm ci
+      - name: Typecheck
+        run: npm run typecheck
+      - name: Offline self-tests
+        run: npm test

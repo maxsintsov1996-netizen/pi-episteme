@@ -28,7 +28,7 @@ import {
  */
 export const ORCHESTRATION_HEADER = `## PI-EPISTEME ORCHESTRATION — static header
 
-You are one role in a sequential multi-agent pipeline that solves a single task with repeated independent calls of one model. Everything above this header in the system prompt is byte-stable across the run: a local inference server may reuse its KV-cache for it. Do not restate the layers back to the caller; read what you need from them.
+You are one role in a sequential multi-agent pipeline that solves a single task with repeated independent calls of one model. This header and the Episteme layers that follow it below in this system prompt are byte-stable across the run: a local inference server may reuse its KV-cache for them. Do not restate the layers back to the caller; read what you need from them.
 
 Layer legend:
 - RESEARCH — the task: goal, outcome, constraints, acceptance criteria.

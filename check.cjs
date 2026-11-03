@@ -376,27 +376,36 @@ const main = async () => {
     );
   });
 
-  await test("plan: parse/firstUnchecked/itemText/planCounts", () => {
+  await test("plan: flat list — indented sub-bullets and fenced lines are not items", () => {
     const raw =
-      "  * [ ] first\n- [X] second\n+ [x] third\nprose line\n- [ ]   spaced  ";
+      "- [X] first\n  - sub-note under first\n+ [x] third\nprose line\n" +
+      "- [ ]   spaced  \n  continued wording\n```\n- item inside a fence\n```";
     const items = episteme.parsePlan(raw);
     assert.deepEqual(
-      items.map((i) => [i.done, i.text]),
+      items.map((i) => [i.id, i.done, i.text]),
       [
-        [false, "first"],
-        [true, "second"],
-        [true, "third"],
-        [false, "spaced"],
+        ["1", true, "first"],
+        ["2", true, "third"],
+        ["3", false, "spaced continued wording"],
       ],
     );
-    assert.equal(episteme.firstUnchecked(raw), 0);
-    assert.equal(episteme.itemText(raw, 1), "second");
-    assert.equal(episteme.planCounts(raw).done, 2);
+    assert.equal(episteme.itemText(raw, 1), "third");
     assert.deepEqual(
       episteme.reportPlanCounts(raw, [{ n: 1 }, { n: 3 }, { n: 99 }]),
-      { done: 2, total: 4 },
+      { done: 2, total: 3 },
     );
     assert.equal(episteme.firstUnreportedPlanStep(raw, [{ n: 1 }, { n: 3 }]), 1);
+    // a nested plan must not produce phantom items that need a STEP report
+    const nested =
+      "- [id:S1] implement parser\n  - handle unicode\n  - handle CRLF\n- [id:S2] run tests";
+    assert.deepEqual(
+      episteme.parsePlan(nested).map((i) => i.id),
+      ["S1", "S2"],
+    );
+    assert.equal(
+      episteme.firstUnreportedPlanStep(nested, [{ key: "S1" }]),
+      1,
+    );
   });
 
   const joinSegments = (segments) => segments.map((s) => s.text).join("");
@@ -523,6 +532,22 @@ const main = async () => {
     assert.ok(!existsSync(join(sessDir, "b.pi_episteme")));
     assert.ok(existsSync(join(sessDir, "c.pi_episteme")));
     assert.ok(existsSync(join(sessDir, "d.txt")));
+  });
+
+  await test("pruneStaleDirs: only age-old directories go", () => {
+    const root = mkdtempSync(join(tmpdir(), "pi-episteme-eph-"));
+    const young = join(root, "young");
+    const old = join(root, "old");
+    mkdirSync(join(young, "tmp"), { recursive: true });
+    mkdirSync(old, { recursive: true });
+    writeFileSync(join(root, "loose.txt"), "x");
+    const past = (Date.now() - 30 * 24 * 3600 * 1000) / 1000;
+    require("node:fs").utimesSync(old, past, past);
+    assert.equal(episteme.pruneStaleDirs(root, 7 * 24 * 3600 * 1000), 1);
+    assert.ok(existsSync(young), "recent dir kept");
+    assert.ok(!existsSync(old), "stale dir pruned");
+    assert.ok(existsSync(join(root, "loose.txt")), "files are never touched");
+    assert.equal(episteme.pruneStaleDirs(join(root, "nope"), 1), 0);
   });
 
   console.log("compaction.ts — session_before_compact");
@@ -886,7 +911,7 @@ const main = async () => {
     );
   });
 
-  await test("plain mode sees PLAN markers kept in Pi's recent tail", async () => {
+  await test("plain mode: blocks kept in Pi's recent tail are not paid for twice", async () => {
     const event = makeEvent({
       firstKept: "m2",
       messages: [assistantMsg("working; old logs are being compacted")],
@@ -907,8 +932,33 @@ const main = async () => {
     );
     assert.ok(res?.compaction);
     assert.equal(res.compaction.details.episteme.mode, "plain");
-    assert.ok(res.compaction.summary.includes("/*EPISTEME::RESEARCH::v1*/"));
-    assert.ok(res.compaction.summary.includes("/*EPISTEME::PLAN::v1*/"));
+    assert.deepEqual(res.compaction.details.episteme.dedupedWithTail, [
+      "RESEARCH",
+      "PLAN",
+    ]);
+    assert.ok(!res.compaction.summary.includes("/*EPISTEME::PLAN::v1*/"));
+    // every layer is still in the context exactly once: canonical summary +
+    // the retained tail pi keeps, so nothing was dropped
+    const seen = episteme.extractLayers(
+      [res.compaction.summary, `${R}\n${PLAN1}`].join("\n\n"),
+    );
+    assert.ok(seen.research.includes("stack: node"));
+    assert.ok(seen.plan.includes("- [ ] write parser"));
+  });
+
+  await test("previousLlmTail parses a deduped (subset) canonical prefix", () => {
+    const subset = [
+      episteme.EPISTEME_MARKER,
+      episteme.epistemeBlock("RESEARCH", "goal: x"),
+      "pi ephemeral summary about tool output",
+    ].join("\n\n");
+    // the PLAN block lives only in the retained tail, so the stored summary is
+    // a subset; the tail splitter must still recognize the canonical part
+    // instead of feeding the layers back to pi's summarizer
+    assert.equal(
+      previousLlmTail(subset),
+      "pi ephemeral summary about tool output",
+    );
   });
 
   await test("plain mode: a research-only session keeps the research block", async () => {
@@ -1084,7 +1134,8 @@ const main = async () => {
       plan: "- [id:S1] first",
       reports: [{ key: "S1", text: "must survive" }],
     });
-    const rt = { ...makeRt(null), layerTokenBudget: 1 };
+    const failDir = mkdtempSync(join(tmpdir(), "pi-episteme-epoch-"));
+    const rt = { ...makeRt(null), epistemeDir: failDir, layerTokenBudget: 1 };
     const res = await handleSessionBeforeCompact(
       makeEvent({ previousSummary, messages: [assistantMsg("work")] }),
       makeCtx(),
@@ -1098,6 +1149,57 @@ const main = async () => {
     assert.ok(res.compaction.summary.includes("STEP-S1"));
     assert.ok(res.compaction.summary.includes("must survive"));
     assert.ok(!res.compaction.summary.includes("MILESTONE-1"));
+    assert.ok(
+      !existsSync(join(failDir, "tmp", "epoch_1_layers.md")),
+      "no epoch archive for a rollover that never happened",
+    );
+  });
+
+  await test("plain compaction does not pay twice for a block the tail keeps", async () => {
+    const layers = {
+      research: "research body",
+      plan: "- [id:S1] first",
+      reports: [{ key: "S1", text: "report body" }],
+    };
+    const previousSummary = episteme.buildEpistemeSummary(layers);
+    const stepBlock = episteme.epistemeBlock("STEP-S1", "report body");
+    const res = await handleSessionBeforeCompact(
+      makeEvent({
+        previousSummary,
+        messages: [assistantMsg("ephemeral work")],
+        firstKept: "m2",
+        branchEntries: [
+          { type: "session", id: "h" },
+          { type: "message", id: "m1", message: userMsg("task", 1) },
+          {
+            type: "message",
+            id: "m2",
+            message: assistantMsg(`Done.\n\n${stepBlock}`, 2),
+          },
+        ],
+      }),
+      makeCtx(),
+      makeRt(null),
+      { summarizePlain: async () => ({ summary: "ephemeral tail" }) },
+    );
+    assert.ok(res?.compaction);
+    assert.ok(
+      !res.compaction.summary.includes("STEP-S1"),
+      "the duplicated report is left out of the summary",
+    );
+    assert.ok(
+      res.compaction.summary.includes("- [id:S1] first"),
+      "blocks that are not in the tail stay canonical",
+    );
+    assert.deepEqual(res.compaction.details.episteme.dedupedWithTail, [
+      "STEP-S1",
+    ]);
+    assert.equal(res.compaction.firstKeptEntryId, "m2", "the tail is still kept");
+    // and the tail copy still folds back into the layers on the next pass
+    const folded = episteme.extractLayers(
+      [res.compaction.summary, stepBlock].join("\n\n"),
+    );
+    assert.deepEqual(folded.reports.map((r) => r.key), ["S1"]);
   });
 
   await test("pi integration: non-context phase sentinel leaves only the episteme summary", async () => {
@@ -1248,6 +1350,12 @@ const main = async () => {
       assert.equal(config.resolveEpistemeSettings(workDir, globalSettings).layerTokenBudget, 256);
       process.env.PI_EPISTEME_LAYER_TOKEN_BUDGET = "1.5";
       assert.equal(config.resolveEpistemeSettings(workDir, globalSettings).layerTokenBudget, 256);
+      // an integer that is not a safe integer must not pass as "huge budget"
+      process.env.PI_EPISTEME_LAYER_TOKEN_BUDGET = "99999999999999999999";
+      assert.equal(
+        config.resolveEpistemeSettings(workDir, globalSettings).layerTokenBudget,
+        256,
+      );
     });
 
     await test("strict boolean env: invalid values fall through to config", () => {
@@ -1480,10 +1588,63 @@ const main = async () => {
       assert.equal(orchestrator.readOrchFixRounds(), 0);
       process.env.PI_EPISTEME_ORCH_FIX_ROUNDS = "bogus";
       assert.equal(orchestrator.readOrchFixRounds(), 2);
+      // a fat value must not become an unattended loop over the working tree
+      process.env.PI_EPISTEME_ORCH_FIX_ROUNDS = "999999999999";
+      assert.equal(orchestrator.readOrchFixRounds(), orchestrator.MAX_FIX_ROUNDS);
     } finally {
       if (saved === undefined) delete process.env.PI_EPISTEME_ORCH_FIX_ROUNDS;
       else process.env.PI_EPISTEME_ORCH_FIX_ROUNDS = saved;
     }
+  });
+
+  console.log("prompts.ts — model-facing texts");
+
+  const prompts = await jiti.import(join(here, "prompts.ts"));
+
+  await test("prompts: flat-list rule, mode texts, byte-identical layer-0 body", () => {
+    const strict = prompts.buildEpistemeInstructions("/d.pi_episteme", "strict");
+    assert.match(strict, /FLAT lists/);
+    assert.match(strict, /only top-level bullets are tracked/);
+    assert.ok(strict.includes("/d.pi_episteme/tmp/step_ID_raw.md"));
+    assert.ok(strict.includes("/*EPISTEME::RESEARCH::v1*/"));
+    assert.ok(
+      prompts.buildEpistemeInstructions("/d", "light").includes("Light mode:"),
+    );
+    assert.ok(strict.includes("Strict mode:"));
+    // the injected message must carry the layer-0 body unchanged, or the model
+    // follows one protocol and gets another when the system prompt takes over
+    assert.ok(
+      prompts
+        .buildEpistemeActivationMessage("/d.pi_episteme", "strict")
+        .endsWith(strict),
+    );
+    const light = prompts.buildEpistemeActivationMessage("/d.pi_episteme", "light");
+    const switched = prompts.buildEpistemeModeSwitchMessage(
+      "/d.pi_episteme",
+      "light",
+      "strict",
+    );
+    assert.ok(switched.includes("Mode switched: light → strict"));
+    assert.ok(
+      switched.endsWith(
+        prompts.buildEpistemeActivationMessage("/d.pi_episteme", "strict"),
+      ),
+    );
+    assert.notEqual(switched, light);
+    assert.match(prompts.buildEpistemeRevocationMessage(), /mode is now OFF/);
+    assert.ok(
+      prompts.buildContinueMessage("S3", "run tests").includes('execute S3: "run tests"'),
+    );
+    const text = prompts.formatOrchestrationOutcome({
+      ok: false,
+      summary: "verifier said no",
+      rounds: 1,
+      completed: ["S1"],
+      issues: ["missing test"],
+    });
+    assert.match(text, /FAILED: verifier said no/);
+    assert.match(text, /corrective rounds: 1/);
+    assert.match(text, /- missing test/);
   });
 
   console.log("index.ts — extension wiring + tool");
@@ -2613,6 +2774,240 @@ implemented parser; files: src/parser.ts; tests green
     const result = await exec("archived-1", { action: "advance", step: "S2" }, undefined, undefined, tCtx);
     assert.ok(!result.isError, result.content[0].text);
     await clearPending();
+  });
+
+  await test("orchestrate is gated by the session mode (tool and command)", async () => {
+    const notes = [];
+    const ctx = {
+      ...tCtx,
+      hasUI: true,
+      waitForIdle: async () => {},
+      ui: {
+        notify: (message, level) => notes.push([message, level]),
+        setWidget: () => {},
+      },
+    };
+    branch.length = 0;
+    handlers.session_start[0]({ type: "session_start" }, ctx); // mode off
+    const off = await exec(
+      "orch-off",
+      { action: "orchestrate", task: "do it" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.ok(off.isError, "orchestrate must not run with the mode off");
+    assert.match(off.content[0].text, /pi-episteme is disabled/);
+    notes.length = 0;
+    await commands["episteme-orchestrate"].handler("do it", ctx);
+    assert.ok(
+      notes.some(([m, level]) => level === "error" && m.includes("disabled")),
+      "the command is gated too",
+    );
+    // enabled but no model -> a different error proves the gate was passed
+    await commands["episteme-on"].handler("light", ctx);
+    const noModel = await exec(
+      "orch-model",
+      { action: "orchestrate", task: "do it" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.ok(noModel.isError);
+    assert.match(noModel.content[0].text, /no model selected/);
+  });
+
+  await test("/episteme abort, unknown subcommand, headless reset all speak up", async () => {
+    const notes = [];
+    const ctx = {
+      ...tCtx,
+      hasUI: true,
+      ui: {
+        notify: (message, level) => notes.push([message, level]),
+        setWidget: () => {},
+      },
+    };
+    await commands.episteme.handler("abort", ctx);
+    assert.ok(notes.some(([m]) => m.includes("no orchestration is running")));
+    notes.length = 0;
+    await commands.episteme.handler("comapct", ctx);
+    assert.ok(
+      notes.some(
+        ([m, level]) =>
+          level === "warning" && m.includes('unknown subcommand "comapct"'),
+      ),
+      "a typo must not look like a successful status call",
+    );
+    assert.ok(notes.some(([m]) => m.includes("dir:")), "status is still shown");
+    notes.length = 0;
+    await commands.episteme.handler("reset", {
+      ...tCtx,
+      hasUI: false,
+      ui: { notify: (message, level) => notes.push([message, level]) },
+    });
+    assert.ok(
+      notes.some(([m, level]) => level === "error" && m.includes("reset needs")),
+      "headless reset explains why it did nothing",
+    );
+  });
+
+  await test("cancelled compaction keeps the phase boundary for a retry", async () => {
+    branch.length = 0;
+    handlers.session_start[0]({ type: "session_start" }, tCtx);
+    await commands["episteme-on"].handler("light", tCtx);
+    branch.push(branchMsg(`${R}\n${PLAN1}`, "b-cancel"));
+    const accepted = await exec(
+      "cancel-1",
+      { action: "advance" },
+      undefined,
+      undefined,
+      tCtx,
+    );
+    assert.ok(!accepted.isError);
+    let requested = null;
+    await handlers.agent_settled[0](
+      { type: "agent_settled" },
+      { ...tCtx, compact: (opts) => (requested = opts) },
+    );
+    requested.onError(new Error("Compaction cancelled"));
+    const kept = await exec(
+      "cancel-2",
+      { action: "status" },
+      undefined,
+      undefined,
+      tCtx,
+    );
+    assert.match(kept.content[0].text, /pending: plan/, "phase survives a cancel");
+    // a hard failure still drops it, so the request cannot leak forever
+    await handlers.agent_settled[0](
+      { type: "agent_settled" },
+      {
+        ...tCtx,
+        compact: (opts) =>
+          opts.onError(new Error("Nothing to compact (session too small)")),
+      },
+    );
+    const after = await exec(
+      "cancel-3",
+      { action: "status" },
+      undefined,
+      undefined,
+      tCtx,
+    );
+    assert.match(after.content[0].text, /pending: none/);
+  });
+
+  await test("no bogus 'summary was replaced' warning after /episteme-off", async () => {
+    branch.length = 0;
+    handlers.session_start[0]({ type: "session_start" }, tCtx);
+    await commands["episteme-on"].handler("light", tCtx);
+    const notes = [];
+    const ctx = {
+      ...tCtx,
+      hasUI: true,
+      ui: {
+        notify: (message, level) => notes.push([message, level]),
+        setWidget: () => {},
+      },
+    };
+    const before = await handlers.session_before_compact[0](
+      makeEvent({ messages: [assistantMsg(`${R}\n${PLAN1}`)] }),
+      ctx,
+    );
+    assert.ok(before?.compaction);
+    handlers.session_compact[0](
+      {
+        type: "session_compact",
+        compactionEntry: {
+          type: "compaction",
+          id: "c-own",
+          summary: before.compaction.summary,
+          firstKeptEntryId: "m2",
+          tokensBefore: 1,
+          details: before.compaction.details,
+        },
+        fromExtension: true,
+      },
+      ctx,
+    );
+    await commands["episteme-off"].handler("", ctx);
+    notes.length = 0;
+    const plain = await handlers.session_before_compact[0](
+      makeEvent({ messages: [assistantMsg("plain work after off")] }),
+      ctx,
+    );
+    assert.equal(plain, undefined, "disabled: pi's default compaction runs");
+    handlers.session_compact[0](
+      {
+        type: "session_compact",
+        compactionEntry: {
+          type: "compaction",
+          id: "c-default",
+          summary: "plain pi summary",
+          firstKeptEntryId: "m2",
+          tokensBefore: 1,
+        },
+        fromExtension: false,
+      },
+      ctx,
+    );
+    assert.ok(
+      !notes.some(([, level]) => level === "warning"),
+      "a compaction we never produced must not be reported as a stolen summary",
+    );
+  });
+
+  await test("worker approval bridge: read-only passes, everything else asks", async () => {
+    const { workerApprovalBridge } = await jiti.import(join(here, "index.ts"));
+    const asked = [];
+    const choices = ["Block this call", "Allow all tools for this run"];
+    let next = 0;
+    const parent = {
+      hasUI: true,
+      ui: {
+        notify: () => {},
+        confirm: async () => true,
+        select: async (title) => {
+          asked.push(title);
+          return choices[Math.min(next++, choices.length - 1)];
+        },
+      },
+    };
+    const state = { approvedAll: false, announcedNoUI: false };
+    const h = {};
+    workerApprovalBridge(parent, state)({ on: (name, handler) => (h[name] = handler) });
+    const blocked = await h.tool_call({
+      type: "tool_call",
+      toolCallId: "t1",
+      toolName: "bash",
+      input: { command: "rm -rf build" },
+    });
+    assert.equal(blocked?.block, true, "bash is blocked until the user says yes");
+    assert.equal(asked.length, 1);
+    assert.equal(
+      await h.tool_call({ type: "tool_call", toolCallId: "t2", toolName: "read", input: {} }),
+      undefined,
+    );
+    assert.equal(asked.length, 1, "read-only tools never interrupt");
+    assert.equal(
+      await h.tool_call({ type: "tool_call", toolCallId: "t3", toolName: "edit", input: {} }),
+      undefined,
+    );
+    assert.equal(asked.length, 2);
+    assert.equal(state.approvedAll, true);
+    await h.tool_call({ type: "tool_call", toolCallId: "t4", toolName: "write", input: {} });
+    assert.equal(asked.length, 2, "the run-level allowance is remembered");
+    // headless: impossible to ask -> say it once, do not pretend to be gated
+    const said = [];
+    const h2 = {};
+    workerApprovalBridge(
+      { hasUI: false, ui: { notify: (m) => said.push(m), select: async () => "x", confirm: async () => true } },
+      { approvedAll: false, announcedNoUI: false },
+    )({ on: (name, handler) => (h2[name] = handler) });
+    await h2.tool_call({ type: "tool_call", toolCallId: "t5", toolName: "bash", input: {} });
+    await h2.tool_call({ type: "tool_call", toolCallId: "t6", toolName: "bash", input: {} });
+    assert.equal(said.length, 1);
+    assert.match(said[0], /unattended/);
   });
 
   await test("light/off/pause/resume and degraded auto-continuation", async () => {

@@ -1,6 +1,6 @@
 {
   "name": "pi-episteme",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Context-aware agent orchestration for pi-coding-agent with local LLMs: layered KV-cache-friendly context (research → plan → steps) plus a file-less GVS-style pipeline (Manager → Workers → Verifier) with a byte-stable prompt prefix.",
   "type": "module",
   "license": "MIT",
@@ -28,6 +28,7 @@
   "files": [
     "index.ts",
     "episteme.ts",
+    "prompts.ts",
     "compaction.ts",
     "config.ts",
     "context.ts",
@@ -45,10 +46,10 @@
     "typecheck": "tsc --noEmit"
   },
   "peerDependencies": {
-    "@earendil-works/pi-ai": "*",
-    "@earendil-works/pi-coding-agent": "*",
-    "@earendil-works/pi-tui": "*",
-    "typebox": "*"
+    "@earendil-works/pi-ai": ">=0.85.0",
+    "@earendil-works/pi-coding-agent": ">=0.85.0",
+    "@earendil-works/pi-tui": ">=0.85.0",
+    "typebox": ">=1.0.0"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",
