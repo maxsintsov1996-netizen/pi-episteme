@@ -2,23 +2,15 @@
 
 # pi-episteme
 
-**Context-aware agent orchestration** for
+**Advanced context compaction** for
 [pi-coding-agent](https://github.com/badlogic/pi-mono) with local LLMs.
 
-Two cooperating levels:
-
-1. **Layered context compaction** — a research → plan → steps pipeline that
-   preserves durable task state while discarding ephemeral logs at phase
-   boundaries. The deterministic, append-friendly prefix is designed for
-   KV-cache reuse with local inference servers such as llama.cpp and Ollama.
-   Actual caching depends on the provider; pi-episteme does not infer a cache
-   hit from latency or token estimates.
-2. **File-less orchestration (Stage 1, GVS-style)** — a sequential
-   Manager → Worker → Verifier pipeline over repeated independent model calls.
-   The run state *is* the Episteme layer set: no task files, no side ledger.
-   Every call shares one byte-stable prompt prefix (static header + canonical
-   layers) and carries role/task data only after it, so a local server can
-   reuse the cached KV prefix across all roles of a run.
+A **research → plan → steps** pipeline that preserves durable task state while
+discarding ephemeral logs at phase boundaries. The session's own agent executes
+the plan; nothing is delegated to subagent runs. The deterministic,
+append-friendly prefix is designed for KV-cache reuse with local inference
+servers such as llama.cpp and Ollama. Actual caching depends on the provider;
+pi-episteme does not infer a cache hit from latency or token estimates.
 
 Specification (Russian): [`SPEC.md`](./SPEC.md). Russian README:
 [`README.ru.md`](./README.ru.md).
@@ -74,23 +66,11 @@ base PLAN is required before `advance` is accepted.
 
 ## Workflow and compaction
 
-1. Episteme is session state and starts **off**. Both modes share the layered
-   protocol and the same structural layer compaction; they differ in **who
-   executes the plan**:
-
-   `/episteme-on` (**light**, the default): the session's own agent works
-   alone, exactly as pi-strata did — it writes RESEARCH/PLAN, implements items
-   one at a time, closes each with a STEP-ID report and `advance`; questions and
-   small tasks stay marker-free. **GVS orchestration is not available here.**
-
-   `/episteme-on strict`: the layered protocol stays the bookkeeping, but
-   substantive implementation work runs through the GVS pipeline (Manager →
-   Worker → per-item Verifier gate → Verifier, see *Orchestration*). The agent
-   is told not to grind such a task out item by item itself. Manual `advance`
-   remains valid for small tasks, for continuing what a run left open, and for
-   recovery after a failed run.
-
-   Re-run the command with the other mode to switch without `/episteme-off`.
+1. Episteme is session state and starts **off**. `/episteme-on` enables it for
+   the session: the session's own agent works alone — it writes RESEARCH/PLAN,
+   implements items one at a time, closes each with a STEP-ID report and
+   `advance`; questions and small tasks stay marker-free. `/episteme-off`
+   disables it again.
 2. In an existing conversation, standing instructions are first appended as a
    message to avoid changing the cached system prefix; they move into the
    system prompt after the next compaction. In an empty session they are added
@@ -127,66 +107,7 @@ request, and queues a notice revoking the standing instructions. While off,
 normal pi compaction is used and `advance` is rejected; `status` still works.
 Resumed sessions also start off, with a notice if existing layers are found.
 
-## Orchestration (strict mode)
-
-GVS orchestration **is** what strict mode means. `episteme(action="orchestrate",
-task="…")` (or `/episteme-orchestrate <task>`) requires a strict session: in
-light mode the session's own agent runs the plan, and the call is refused with
-an error naming the switch. With the mode off entirely, pi's default summarizer
-would also swallow the layers the run produces:
-
-1. **Manager** (chat-only model call) writes RESEARCH and a base PLAN in
-   Episteme marker blocks. Malformed plans are fed back once for a retry.
-2. **Workers** execute plan items strictly in order — one independent,
-   in-memory agent session per item (default coding tools, fresh context each
-   time). A Worker ends with a STEP-ID report; without a marker block its final
-   message is kept as the report.
-
-   **Per-item gate.** If an item declares something to run (a command in
-   backticks, or a recognisable tool such as `npm`, `pytest`, `go test`, `tsc`),
-   an independent Verifier session checks *that item alone* right after its
-   Worker, and on a fail verdict the same item goes back to a Worker with the
-   issues (scope unchanged, ID unchanged) for up to 2 fix attempts. Items with
-   nothing to re-run are judged once by the final whole-plan Verifier instead of
-   paying for a session that could only read files. An item that still fails
-   after its attempts does not abort the run: it is recorded as an independently
-   observed defect, keeps the run failed even if the final verdict says pass, and
-   feeds the Manager's corrective round.
-
-   Workers load with `noExtensions` so a run cannot recurse into pi-episteme.
-   In pi, tool permission is itself an extension, so pi-episteme re-attaches
-   exactly that one concern as an inline extension: every non-read-only worker
-   tool call (bash, edit, write, …) is confirmed on the **parent** session's UI,
-   with "allow once", "allow all for this run" and "block". Project context
-   files (AGENTS.md) are loaded into workers — they edit this repository and
-   must see its conventions, and they are identical across roles, so the
-   byte-stable prefix is unaffected. In a headless session there is nobody to
-   ask: workers run unattended and pi-episteme says so once, explicitly.
-3. **Verifier** (independent agent session) re-runs the plan's verification
-   commands and replies with a single JSON verdict. On failure the Manager
-   issues a PLAN-DELTA with corrective items under fresh IDs (completed items
-   are immutable and never re-executed); the number of corrective rounds is
-   bounded by `PI_EPISTEME_ORCH_FIX_ROUNDS` (default 2, hard ceiling 10 — each
-   round re-runs outstanding items against the real working tree).
-
-   A run of independent tool-using sessions must be stoppable: `/episteme abort`
-   aborts the live run, and session shutdown aborts it too. A command handler
-   gets no operation signal from pi, so `/episteme-orchestrate` drives its own
-   AbortController; a run started through the tool also honours the tool's own
-   cancel signal.
-4. On completion the orchestrator queues a persist request asking the main
-   agent to re-emit the canonical blocks as its own assistant text, so the run
-   state survives compaction in this session. **No orchestration state is
-   written to files.**
-
-KV-cache contract: within a run, every call's system prompt is
-`[static orchestration header] + [canonical Episteme layers]`, rebuilt from
-the same layer values; role instructions and the current subtask live only in
-the dynamic user-message tail. Unchanged layers yield identical prefix bytes.
-Only one orchestration can run at a time; it aborts with the calling tool's
-abort signal.
-
-### Milestone rollover
+## Layer budget and milestone rollover
 
 `layerTokenBudget` defaults to **16384 estimated tokens**, where the estimate
 is `ceil(characters / 4)` for the complete canonical layer summary. `0`
@@ -204,15 +125,15 @@ If milestone summarization fails, the full reports remain in the layers; no
 progress is discarded. This is different from plain summarization, from which
 layers are filtered.
 
-### Auto-continue and UI
+## Auto-continue and UI
 
 `autoContinue` is on by default. After advance processing, including explicit
 degraded continuation, it queues the next unfinished plan item. `/episteme pause`
 suppresses only auto-continue, not execution or compaction; `/episteme resume`
 re-enables it and queues the next item when idle.
 
-The TUI shows plan progress or the current strict/light/off/paused mode (and
-whether GVS orchestration is available in it).
+The TUI shows plan progress, or the current on/off/paused state while there is
+no plan to show.
 Marker anchors are hidden by default in the display only; the session and
 model context retain them. Raw snapshots can be removed with `/episteme reset`.
 Orphaned snapshot directories for deleted sessions are cleaned at session
@@ -256,19 +177,12 @@ adds no runtime package dependency.
   position; it must be an integer of at least 1. String IDs use
   `[A-Za-z0-9][A-Za-z0-9_-]*`.
 - `episteme(action="status")` — show current state and usage/status estimates.
-- `episteme(action="orchestrate", task="…")` — run the file-less
-  Manager → Worker → Verifier pipeline for a complex task.
 - `/episteme` — show status; `/episteme compact` — request manual compaction;
-  `/episteme abort` — abort the running orchestration; `/episteme reset` —
-  confirm and delete this session's raw snapshots. An unknown subcommand says so
-  instead of silently showing status.
+  `/episteme reset` — confirm and delete this session's raw snapshots. An
+  unknown subcommand says so instead of silently showing status.
 - `/episteme pause` and `/episteme resume` — pause/resume auto-continue.
-- `/episteme-on [strict|light]` — enable the session in the selected mode
-  (light = the agent works alone; strict = GVS pipeline; light by default,
-  re-run with the other mode to switch).
+- `/episteme-on` — enable the mode for this session.
 - `/episteme-off` — disable the session and revoke standing instructions.
-- `/episteme-orchestrate <task>` — run the GVS pipeline from the command line
-  (same as the `orchestrate` tool action); strict mode only.
 
 ## Configuration
 
@@ -282,7 +196,6 @@ default**. Invalid values fall through to the next source. Files are
 | `PI_EPISTEME_AUTO_CONTINUE` | `piEpisteme.autoContinue` | `true` | Queue the next unfinished item after advance processing |
 | `PI_EPISTEME_HIDE_ANCHORS` | `piEpisteme.hideAnchors` | `true` | Hide marker anchors in the TUI only |
 | `PI_EPISTEME_LAYER_TOKEN_BUDGET` | `piEpisteme.layerTokenBudget` | `16384` | Estimated layer budget; `0` disables milestone rollover (must be a safe integer) |
-| `PI_EPISTEME_ORCH_FIX_ROUNDS` | — | `2` | Orchestration corrective rounds after a failed verification (clamped to 10) |
 
 Boolean environment parsing is strict and case-insensitive after trimming:
 true values are `1`, `true`, `on`; false values are `0`, `false`, `off`.
@@ -305,16 +218,13 @@ Example:
 ## Structure and verification
 
 ```text
-index.ts        — session events, commands, tool, widgets, orchestration glue
-prompts.ts      — every model-facing text (layer-0 protocol, role/activation texts)
+index.ts        — session events, commands, tool, widgets
+prompts.ts      — every model-facing text (the layer-0 protocol)
 compaction.ts   — plan/step/plain compaction, milestones, raw fallback
 episteme.ts     — markers, stable-ID plans, extraction, canonical summaries
-context.ts      — orchestration context builder (byte-stable prefix + role tails)
-orchestrator.ts — Manager → Worker → Verifier loop (file-less, abortable)
 config.ts       — environment/settings resolution and defaults
 check.cjs       — offline self-tests
 local-check.cjs — optional OpenAI-compatible endpoint smoke check
-docs/design/    — historical design notes (pre-rename pi-strata → episteme)
 ```
 
 ```bash

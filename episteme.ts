@@ -406,7 +406,6 @@ export function planDashboardSegments(
 
 export function modeSegments(
   enabled: boolean,
-  mode: "strict" | "light" = "light",
   paused = false,
 ): WidgetSegment[] {
   if (!enabled)
@@ -416,7 +415,7 @@ export function modeSegments(
     ];
   return [
     { text: " episteme", color: "accent" },
-    { text: paused ? "  paused" : `  ${mode}`, color: paused ? "dim" : "success" },
+    { text: paused ? "  paused" : "  on", color: paused ? "dim" : "success" },
   ];
 }
 

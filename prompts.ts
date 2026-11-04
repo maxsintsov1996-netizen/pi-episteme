@@ -9,7 +9,6 @@
 // message must be what later sits in the system prompt.
 
 import { epistemePaths } from "./episteme.ts";
-import type { OrchestrationOutcome } from "./orchestrator.ts";
 
 /**
  * customType of the standing-instructions message injected by /episteme-on in
@@ -19,41 +18,14 @@ import type { OrchestrationOutcome } from "./orchestrator.ts";
  */
 export const INSTRUCTIONS_CUSTOM_TYPE = "episteme-instructions";
 
-export type EpistemeMode = "strict" | "light";
-
-/**
- * The mode contract. Both modes share the layered protocol below and the same
- * structural (rule-based) layer compaction; they differ in WHO executes the
- * plan. light = this session's agent, alone, exactly as pi-strata worked.
- * strict = a GVS run: Manager plans, Workers execute single items, each item
- * with a verification command passes its own Verifier gate, a final Verifier
- * judges the whole plan.
- */
-function activationRule(mode: EpistemeMode): string {
-  if (mode === "strict")
-    return 'Strict mode: the pipeline below is the bookkeeping, but substantive implementation work goes through the GVS pipeline — call episteme(action="orchestrate", task="…") (or /episteme-orchestrate <task>) and let Manager → Worker → per-item Verifier gate → Verifier execute it. Do not grind such a task out yourself item by item. Manual advance stays available and correct for small tasks, for continuing work a run left unfinished, and for recovering from a failed run. For questions, clarification, or discussion without a task, just answer without markers.';
-  return "Light mode: you work alone — no subagent runs, no orchestration. Answer questions and complete small tasks normally, without markers. When a task is substantial enough to benefit from phased context, run the pipeline below yourself: write RESEARCH and PLAN, execute one item at a time, close each with a STEP-ID report and advance. Orchestration is unavailable here; /episteme-on strict turns it on.";
-}
-
-/** The execution-model rule that follows from the mode. */
-function executionRule(mode: EpistemeMode): string {
-  if (mode === "strict")
-    return "- Real work prefers a GVS run: its Manager writes RESEARCH and PLAN, its Workers execute exactly one item each, every item that declares a verification command is checked by its own independent Verifier gate (with bounded fix attempts), and a final Verifier judges the whole plan. When a run reports its blocks, re-emit them so this session keeps the layers. Never call orchestrate while another run is live; /episteme abort stops one.";
-  return "- You are the only executor in this mode: implement items yourself, in plan order. The layers survive compaction by structural extraction (they are re-emitted verbatim, not paraphrased), so a report you wrote stays readable years later in a compacted session — keep it factual and self-contained.";
-}
-
 /** Static per-session instructions appended to the system prompt (layer 0). */
-export function buildEpistemeInstructions(
-  epistemeDir: string,
-  mode: EpistemeMode = "light",
-): string {
+export function buildEpistemeInstructions(epistemeDir: string): string {
   const p = epistemePaths(epistemeDir);
-  const activation = activationRule(mode);
   return `## PI-EPISTEME — layered context (KV-cache optimization)
 
 You work with a layered context: [system] → [research] → [plan] → [milestones] → [step reports] → [plan delta]. Ephemeral work is appended at the end and a phase-boundary compaction is requested after every advance. Small sessions can remain temporarily uncompacted when the host pi does not support forced compaction; keep following the protocol.
 
-${activation}
+You execute the plan yourself, in this session, one item at a time — no subagent runs. Answer questions and do small one-off work normally, without markers; use the pipeline below when there is real multi-step work to keep.
 
 Write each phase between exact markers. The last occurrence of a block wins. A new RESEARCH starts a new task cycle and clears the previous PLAN, PLAN-DELTA, STEP, and MILESTONE layers. Never rely on a previous cycle's reports.
 
@@ -71,7 +43,7 @@ Pipeline:
 5. Reports and MILESTONE digests are the information store for later steps. Do not omit key facts.
 
 Rules:
-${executionRule(mode)}
+- You are the only executor: implement items yourself, in plan order. The layers survive compaction by structural extraction (they are re-emitted verbatim, not paraphrased), so a report you wrote stays readable years later in a compacted session — keep it factual and self-contained.
 - PLAN and PLAN-DELTA are FLAT lists: every item is one top-level "- [id:…] …" line starting at column 0. Do not nest sub-bullets and do not put plan items inside a code fence — only top-level bullets are tracked, and every tracked item must eventually carry a STEP report. Put details in the item text or in RESEARCH.
 - Do not re-emit PLAN to tick checkboxes. Progress comes from STEP and MILESTONE completion records.
 - To change the current plan, write PLAN-DELTA containing the FULL new effective plan with the same IDs for existing items. Completed item IDs and their action text are immutable. Add new work under fresh IDs.
@@ -86,38 +58,12 @@ ${executionRule(mode)}
  * byte-identical to buildEpistemeInstructions, so after the system prompt picks
  * the instructions up the model sees the same protocol it followed before).
  */
-export function buildEpistemeActivationMessage(
-  epistemeDir: string,
-  mode: EpistemeMode,
-): string {
+export function buildEpistemeActivationMessage(epistemeDir: string): string {
   return (
-    `[pi-episteme] Layered-context ${mode} mode is now ON for this session. ` +
+    "[pi-episteme] Layered-context mode is now ON for this session. " +
     "The standing instructions below apply until /episteme-off; after the next " +
     `compaction they move into the system prompt and this message is dropped.\n\n` +
-    buildEpistemeInstructions(epistemeDir, mode)
-  );
-}
-
-/** What switching modes actually grants or takes away, for the model. */
-function modeSwitchNote(previous: EpistemeMode, next: EpistemeMode): string {
-  if (previous === next) return "";
-  return next === "strict"
-    ? ' GVS orchestration is now available: use episteme(action="orchestrate") for substantive implementation work.'
-    : ' GVS orchestration is no longer available — episteme(action="orchestrate") will be rejected; execute plan items yourself.';
-}
-
-/** Supersedes an earlier activation notice when the mode is switched in place. */
-export function buildEpistemeModeSwitchMessage(
-  epistemeDir: string,
-  previous: EpistemeMode,
-  next: EpistemeMode,
-): string {
-  return (
-    `[pi-episteme] Mode switched: ${previous} → ${next}.` +
-    modeSwitchNote(previous, next) +
-    " The standing instructions below supersede the earlier activation; " +
-    "the previous set no longer applies.\n\n" +
-    buildEpistemeActivationMessage(epistemeDir, next)
+    buildEpistemeInstructions(epistemeDir)
   );
 }
 
@@ -128,34 +74,6 @@ export function buildEpistemeRevocationMessage(): string {
     "pi-episteme instructions are revoked; do not emit new EPISTEME blocks or " +
     "call advance unless the user explicitly enables the mode again."
   );
-}
-
-/** Ask the main agent to persist an orchestration run as its own layers. */
-export function buildOrchestrationPersistRequest(
-  outcome: OrchestrationOutcome,
-  blocks: string,
-): string {
-  return (
-    `PI-EPISTEME: orchestration ${outcome.ok ? "succeeded" : "finished with failures"}. ` +
-    "Persist the run state: emit the canonical blocks below verbatim as your next assistant message " +
-    "(marker blocks exactly as shown, no code fences), so the layers become the durable state of this session. " +
-    "Then briefly report the result to the user.\n\n" +
-    blocks
-  );
-}
-
-/** Render the orchestration result for the tool result / the TUI. */
-export function formatOrchestrationOutcome(
-  outcome: OrchestrationOutcome,
-): string {
-  const lines = [
-    `Orchestration ${outcome.ok ? "PASSED" : "FAILED"}: ${outcome.summary}`,
-    `completed steps: [${outcome.completed.join(",")}]`,
-  ];
-  if (outcome.rounds > 0) lines.push(`corrective rounds: ${outcome.rounds}`);
-  if (outcome.issues.length > 0)
-    lines.push(`open issues:\n${outcome.issues.map((i) => `- ${i}`).join("\n")}`);
-  return lines.join("\n");
 }
 
 /** Queued auto-continue message for the next unfinished plan item. */

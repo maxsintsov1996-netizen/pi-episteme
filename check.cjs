@@ -462,16 +462,12 @@ const main = async () => {
     );
   });
 
-  await test("modeSegments: strict/light/paused=success, off=dim", () => {
-    assert.deepEqual(episteme.modeSegments(true, "strict"), [
-      { text: " episteme", color: "accent" },
-      { text: "  strict", color: "success" },
-    ]);
+  await test("modeSegments: on=success, paused/off=dim", () => {
     assert.deepEqual(episteme.modeSegments(true), [
       { text: " episteme", color: "accent" },
-      { text: "  light", color: "success" },
+      { text: "  on", color: "success" },
     ]);
-    assert.deepEqual(episteme.modeSegments(true, "light", true), [
+    assert.deepEqual(episteme.modeSegments(true, true), [
       { text: " episteme", color: "accent" },
       { text: "  paused", color: "dim" },
     ]);
@@ -1393,395 +1389,37 @@ const main = async () => {
     }
   }
 
-  console.log("context.ts + orchestrator.ts — stage-1 GVS pipeline");
-
-  const context = await jiti.import(join(here, "context.ts"));
-  const orchestrator = await jiti.import(join(here, "orchestrator.ts"));
-
-  await test("context: prefix is byte-stable across roles for the same layers", () => {
-    const layers = episteme.blocksToLayers([
-      { key: "RESEARCH", text: "goal: ship it" },
-      { key: "PLAN", text: "- [id:S1] do the thing" },
-    ]);
-    const p1 = context.buildOrchestrationPrefix(layers);
-    const p2 = context.buildOrchestrationPrefix(layers);
-    assert.equal(p1, p2);
-    assert.ok(p1.startsWith(context.ORCHESTRATION_HEADER));
-    assert.ok(p1.includes("/*EPISTEME::PLAN::v1*/"));
-    // roles differ ONLY in the dynamic tail, never in the prefix
-    const worker = context.buildOrchestrationContext(
-      layers,
-      context.workerTail({ id: "S1", text: "do the thing" }),
-    );
-    const verifier = context.buildOrchestrationContext(
-      layers,
-      context.verifierTail(),
-    );
-    assert.equal(worker.systemPrompt, verifier.systemPrompt);
-    assert.notEqual(worker.message, verifier.message);
-    // volatile role/task data stays out of the prefix
-    assert.ok(!p1.includes("WORKER"));
-    assert.ok(!p1.includes("VERIFIER"));
-  });
-
-  await test("context: prefix changes only when the layers change", () => {
-    const l1 = episteme.blocksToLayers([
-      { key: "RESEARCH", text: "r" },
-      { key: "PLAN", text: "- [id:S1] a" },
-    ]);
-    const l2 = episteme.blocksToLayers([
-      { key: "RESEARCH", text: "r" },
-      { key: "PLAN", text: "- [id:S1] a" },
-      { key: "STEP-S1", text: "done" },
-    ]);
-    const p1 = context.buildOrchestrationPrefix(l1);
-    const p2 = context.buildOrchestrationPrefix(l2);
-    assert.notEqual(p1, p2);
-    assert.ok(p2.startsWith(p1.slice(0, p1.indexOf("/*EPISTEME::"))));
-    assert.ok(p2.includes("/*EPISTEME::STEP-S1::v1*/"));
-  });
-
-  await test("orchestrator: workerReport keeps the STEP block, falls back to raw text", () => {
-    const withBlock =
-      "some prose\n/*EPISTEME::STEP-S1::v1*/\nreport body\n/*EPISTEME::END::STEP-S1::v1*/\ntrailing";
-    assert.deepEqual(orchestrator.workerReport("S1", withBlock), {
-      key: "S1",
-      text: "report body",
-    });
-    assert.deepEqual(orchestrator.workerReport("S1", "no markers here"), {
-      key: "S1",
-      text: "no markers here",
-    });
-  });
-
-  await test("orchestrator: verifierVerdict parses JSON, fails closed on garbage", () => {
-    const good = orchestrator.verifierVerdict(
-      'noise {"verdict":"pass","issues":[],"summary":"all green"} tail',
-    );
-    assert.equal(good.verdict, "pass");
-    assert.equal(good.summary, "all green");
-    const bad = orchestrator.verifierVerdict("I refuse to answer");
-    assert.equal(bad.verdict, "fail");
-    assert.ok(bad.issues.length > 0);
-  });
-
-  const MANAGER_PLAN =
-    "/*EPISTEME::RESEARCH::v1*/\ngoal: g\n/*EPISTEME::END::RESEARCH::v1*/\n" +
-    "/*EPISTEME::PLAN::v1*/\n- [id:S1] first step\n- [id:S2] second step\n/*EPISTEME::END::PLAN::v1*/";
-
-  await test("orchestrator: full run, steps execute in plan order, verifier pass", async () => {
-    const workerCalls = [];
-    const prefixes = new Set();
-    const deps = {
-      callModel: async (call) => {
-        prefixes.add(call.systemPrompt);
-        return MANAGER_PLAN;
-      },
-      runAgent: async (call) => {
-        workerCalls.push(call.message);
-        prefixes.add(call.systemPrompt);
-        if (call.message.includes("step S1"))
-          return "/*EPISTEME::STEP-S1::v1*/\nS1 done\n/*EPISTEME::END::STEP-S1::v1*/";
-        if (call.message.includes("step S2"))
-          return "/*EPISTEME::STEP-S2::v1*/\nS2 done\n/*EPISTEME::END::STEP-S2::v1*/";
-        return '{"verdict":"pass","issues":[],"summary":"verified"}';
-      },
-    };
-    const outcome = await orchestrator.runOrchestration("do it", deps, {
-      maxFixRounds: 1,
-    });
-    assert.equal(outcome.ok, true);
-    assert.deepEqual(outcome.completed.sort(), ["S1", "S2"]);
-    assert.equal(outcome.rounds, 0);
-    assert.equal(outcome.summary, "verified");
-    // two worker tails + one verifier tail: S1 first, S2 second
-    assert.ok(workerCalls[0].includes("step S1"));
-    assert.ok(workerCalls[1].includes("step S2"));
-    // the S2 worker call saw the S1 report in its prefix (layer-carried state)
-    const s2CallPrefix = [...prefixes].find((p) =>
-      p.includes("/*EPISTEME::STEP-S1::v1*/"),
-    );
-    assert.ok(s2CallPrefix);
-  });
-
-  await test("orchestrator: verifier fail triggers a PLAN-DELTA fix round", async () => {
-    const deltas = [];
-    const executed = [];
-    let verifierCalls = 0;
-    const deps = {
-      callModel: async (call) => {
-        if (call.message.includes("plan correction")) {
-          deltas.push(call.message);
-          return (
-            "/*EPISTEME::PLAN-DELTA::v1*/\n- [id:S1] first step\n- [id:S2] second step\n- [id:S3] fix the regression\n/*EPISTEME::END::PLAN-DELTA::v1*/"
-          );
-        }
-        return MANAGER_PLAN;
-      },
-      runAgent: async (call) => {
-        if (call.message.includes("VERIFIER")) {
-          verifierCalls += 1;
-          return verifierCalls === 1
-            ? '{"verdict":"fail","issues":["tests broke"],"summary":"regression"}'
-            : '{"verdict":"pass","issues":[],"summary":"fixed"}';
-        }
-        for (const id of ["S1", "S2", "S3"]) {
-          if (call.message.includes(`step ${id}`)) {
-            executed.push(id);
-            return `/*EPISTEME::STEP-${id}::v1*/\n${id} done\n/*EPISTEME::END::STEP-${id}::v1*/`;
-          }
-        }
-        throw new Error(`unexpected worker task: ${call.message.slice(0, 80)}`);
-      },
-    };
-    const outcome = await orchestrator.runOrchestration("do it", deps, {
-      maxFixRounds: 2,
-    });
-    assert.equal(outcome.ok, true);
-    assert.equal(outcome.rounds, 1);
-    assert.equal(deltas.length, 1);
-    // S1 and S2 ran exactly once (before the delta); the fix round executed
-    // only the fresh corrective item S3 — completed work is never redone.
-    assert.deepEqual(executed, ["S1", "S2", "S3"]);
-    assert.ok(outcome.completed.includes("S2"));
-    assert.ok(outcome.completed.includes("S3"));
-  });
-
-  await test("orchestrator: fix-round budget exhaustion fails closed", async () => {
-    const deps = {
-      callModel: async (call) =>
-        call.message.includes("plan correction")
-          ? "/*EPISTEME::PLAN-DELTA::v1*/\n- [id:S1] first step\n- [id:S9] retry\n/*EPISTEME::END::PLAN-DELTA::v1*/"
-          : MANAGER_PLAN,
-      runAgent: async (call) =>
-        call.message.includes("VERIFIER")
-          ? '{"verdict":"fail","issues":["still broken"],"summary":"nope"}'
-          : "/*EPISTEME::STEP-S1::v1*/\ndone\n/*EPISTEME::END::STEP-S1::v1*/",
-    };
-    const outcome = await orchestrator.runOrchestration("do it", deps, {
-      maxFixRounds: 1,
-    });
-    assert.equal(outcome.ok, false);
-    assert.equal(outcome.rounds, 1);
-    assert.deepEqual(outcome.issues, ["still broken"]);
-  });
-
-  const MANAGER_PLAN_CHECKED =
-    "/*EPISTEME::RESEARCH::v1*/\ngoal: g\n/*EPISTEME::END::RESEARCH::v1*/\n" +
-    "/*EPISTEME::PLAN::v1*/\n- [id:S1] implement it and run `npm test`\n/*EPISTEME::END::PLAN::v1*/";
-  const stepReport = (id, body) =>
-    `/*EPISTEME::STEP-${id}::v1*/\n${body}\n/*EPISTEME::END::STEP-${id}::v1*/`;
-
-  await test("orchestrator: itemHasVerification gates on a runnable command", () => {
-    assert.equal(orchestrator.itemHasVerification("add test, run `npm test`"), true);
-    assert.equal(orchestrator.itemHasVerification("run npm test and report"), true);
-    assert.equal(orchestrator.itemHasVerification("go vet ./... before merge"), true);
-    assert.equal(orchestrator.itemHasVerification("read config.ts and describe it"), false);
-    assert.equal(orchestrator.itemHasVerification("second step"), false);
-  });
-
-  await test("orchestrator: items without a verification command get no per-item gate", async () => {
-    const calls = [];
-    const deps = {
-      callModel: async () => MANAGER_PLAN,
-      runAgent: async (call) => {
-        calls.push(call.message);
-        if (call.message.includes("ROLE: VERIFIER"))
-          return '{"verdict":"pass","issues":[],"summary":"ok"}';
-        for (const id of ["S1", "S2"])
-          if (call.message.includes(`step ${id}`)) return stepReport(id, `${id} done`);
-        throw new Error("unexpected call");
-      },
-    };
-    const outcome = await orchestrator.runOrchestration("do it", deps, {
-      maxFixRounds: 0,
-    });
-    assert.equal(outcome.ok, true);
-    assert.equal(
-      calls.filter((m) => m.includes("gate for step")).length,
-      0,
-      "prose-only items must not pay for a Verifier session",
-    );
-  });
-
-  await test("orchestrator: failed item gate loops back to the same worker", async () => {
-    const phases = [];
-    const fixTails = [];
-    let gates = 0;
-    const deps = {
-      callModel: async () => MANAGER_PLAN_CHECKED,
-      runAgent: async (call) => {
-        if (call.message.includes("gate for step")) {
-          gates += 1;
-          return gates === 1
-            ? '{"verdict":"fail","issues":["npm test exits 1"],"summary":"red"}'
-            : '{"verdict":"pass","issues":[],"summary":"green"}';
-        }
-        if (call.message.includes("ROLE: VERIFIER"))
-          return '{"verdict":"pass","issues":[],"summary":"whole plan fine"}';
-        if (call.message.includes("fix attempt")) {
-          fixTails.push(call.message);
-          return stepReport("S1", "S1 fixed, npm test green");
-        }
-        return stepReport("S1", "S1 done, tests not run");
-      },
-    };
-    const outcome = await orchestrator.runOrchestration("do it", deps, {
-      maxFixRounds: 0,
-      maxStepFixRounds: 2,
-      onPhase: (p) => phases.push(p),
-    });
-    assert.deepEqual(phases, [
-      "manager:planning",
-      "worker:S1",
-      "step-verifier:S1",
-      "worker:S1:fix-1",
-      "step-verifier:S1",
-      "verifier",
-    ]);
-    assert.equal(outcome.ok, true);
-    assert.equal(outcome.rounds, 0, "an item-level fix is not a plan corrective round");
-    assert.ok(fixTails[0].includes("npm test exits 1"), "issues reach the worker");
-    assert.ok(
-      fixTails[0].includes("do not widen its scope"),
-      "the fix stays inside the same plan item",
-    );
-    assert.ok(
-      outcome.layers.reports.some(
-        (r) => r.key === "S1" && r.text.includes("npm test green"),
-      ),
-      "the corrected report replaces the failed one",
-    );
-  });
-
-  await test("orchestrator: a permanently failing gate fails the run closed", async () => {
-    const phases = [];
-    let fixes = 0;
-    const deps = {
-      callModel: async () => MANAGER_PLAN_CHECKED,
-      runAgent: async (call) => {
-        if (call.message.includes("gate for step"))
-          return '{"verdict":"fail","issues":["still red"],"summary":"red"}';
-        // The whole-plan Verifier is happy — an independently observed item
-        // defect must still fail the run.
-        if (call.message.includes("ROLE: VERIFIER"))
-          return '{"verdict":"pass","issues":[],"summary":"looks fine to me"}';
-        if (call.message.includes("fix attempt")) fixes += 1;
-        return stepReport("S1", "attempt");
-      },
-    };
-    const outcome = await orchestrator.runOrchestration("do it", deps, {
-      maxFixRounds: 0,
-      maxStepFixRounds: 1,
-      onPhase: (p) => phases.push(p),
-    });
-    assert.equal(outcome.ok, false);
-    assert.equal(fixes, 1, "fix attempts are bounded by maxStepFixRounds");
-    assert.deepEqual(outcome.issues, ["S1: still red"]);
-    assert.match(outcome.summary, /failed their own verification gate/);
-    assert.equal(
-      phases.filter((p) => p === "step-verifier:S1").length,
-      2,
-      "gate runs once per attempt plus the final one",
-    );
-  });
-
-  await test("orchestrator: abort rejects the run", async () => {
-    const controller = new AbortController();
-    controller.abort();
-    const deps = {
-      callModel: async () => MANAGER_PLAN,
-      runAgent: async () => "x",
-    };
-    await assert.rejects(
-      orchestrator.runOrchestration("do it", deps, { signal: controller.signal }),
-      /aborted/,
-    );
-  });
-
-  await test("orchestrator: readOrchFixRounds env override", () => {
-    const saved = process.env.PI_EPISTEME_ORCH_FIX_ROUNDS;
-    try {
-      delete process.env.PI_EPISTEME_ORCH_FIX_ROUNDS;
-      assert.equal(orchestrator.readOrchFixRounds(), 2);
-      process.env.PI_EPISTEME_ORCH_FIX_ROUNDS = "0";
-      assert.equal(orchestrator.readOrchFixRounds(), 0);
-      process.env.PI_EPISTEME_ORCH_FIX_ROUNDS = "bogus";
-      assert.equal(orchestrator.readOrchFixRounds(), 2);
-      // a fat value must not become an unattended loop over the working tree
-      process.env.PI_EPISTEME_ORCH_FIX_ROUNDS = "999999999999";
-      assert.equal(orchestrator.readOrchFixRounds(), orchestrator.MAX_FIX_ROUNDS);
-    } finally {
-      if (saved === undefined) delete process.env.PI_EPISTEME_ORCH_FIX_ROUNDS;
-      else process.env.PI_EPISTEME_ORCH_FIX_ROUNDS = saved;
-    }
-  });
-
   console.log("prompts.ts — model-facing texts");
 
   const prompts = await jiti.import(join(here, "prompts.ts"));
 
-  await test("prompts: flat-list rule, mode texts, byte-identical layer-0 body", () => {
-    const strict = prompts.buildEpistemeInstructions("/d.pi_episteme", "strict");
-    const lightInstr = prompts.buildEpistemeInstructions("/d", "light");
-    assert.match(strict, /FLAT lists/);
-    assert.match(strict, /only top-level bullets are tracked/);
-    assert.ok(strict.includes("/d.pi_episteme/tmp/step_ID_raw.md"));
-    assert.ok(strict.includes("/*EPISTEME::RESEARCH::v1*/"));
-    assert.ok(lightInstr.includes("Light mode:"));
-    assert.ok(strict.includes("Strict mode:"));
-    // Mode semantics: light = single agent, no GVS; strict = GVS per item.
-    assert.match(lightInstr, /you work alone/i);
-    assert.match(lightInstr, /orchestration is unavailable here/i);
+  await test("prompts: flat-list rule, single-agent protocol, byte-identical layer-0 body", () => {
+    const instructions = prompts.buildEpistemeInstructions("/d.pi_episteme");
+    assert.match(instructions, /FLAT lists/);
+    assert.match(instructions, /only top-level bullets are tracked/);
+    assert.ok(instructions.includes("/d.pi_episteme/tmp/step_ID_raw.md"));
+    assert.ok(instructions.includes("/*EPISTEME::RESEARCH::v1*/"));
+    // the session's own agent is the only executor: no subagent run is offered
+    assert.match(instructions, /You execute the plan yourself/);
+    assert.match(instructions, /no subagent runs/);
     assert.ok(
-      !/call episteme\(action="orchestrate"\)/.test(lightInstr),
-      "light instructions must not invite a GVS run",
+      !/orchestrat/i.test(instructions),
+      "instructions must not mention orchestration at all",
     );
-    assert.match(strict, /episteme\(action="orchestrate", task="…"\)/);
-    assert.match(strict, /per-item Verifier gate/);
-    assert.match(strict, /advance stays available/);
-    assert.match(
-      prompts.buildEpistemeModeSwitchMessage("/d", "light", "strict"),
-      /GVS orchestration is now available/,
-    );
-    assert.match(
-      prompts.buildEpistemeModeSwitchMessage("/d", "strict", "light"),
-      /no longer available/,
-    );
+    assert.ok(!/strict|light mode/i.test(instructions), "no mode wording left");
     // the injected message must carry the layer-0 body unchanged, or the model
     // follows one protocol and gets another when the system prompt takes over
     assert.ok(
       prompts
-        .buildEpistemeActivationMessage("/d.pi_episteme", "strict")
-        .endsWith(strict),
+        .buildEpistemeActivationMessage("/d.pi_episteme")
+        .endsWith(instructions),
     );
-    const light = prompts.buildEpistemeActivationMessage("/d.pi_episteme", "light");
-    const switched = prompts.buildEpistemeModeSwitchMessage(
-      "/d.pi_episteme",
-      "light",
-      "strict",
-    );
-    assert.ok(switched.includes("Mode switched: light → strict"));
-    assert.ok(
-      switched.endsWith(
-        prompts.buildEpistemeActivationMessage("/d.pi_episteme", "strict"),
-      ),
-    );
-    assert.notEqual(switched, light);
     assert.match(prompts.buildEpistemeRevocationMessage(), /mode is now OFF/);
     assert.ok(
-      prompts.buildContinueMessage("S3", "run tests").includes('execute S3: "run tests"'),
+      prompts
+        .buildContinueMessage("S3", "run tests")
+        .includes('execute S3: "run tests"'),
     );
-    const text = prompts.formatOrchestrationOutcome({
-      ok: false,
-      summary: "verifier said no",
-      rounds: 1,
-      completed: ["S1"],
-      issues: ["missing test"],
-    });
-    assert.match(text, /FAILED: verifier said no/);
-    assert.match(text, /corrective rounds: 1/);
-    assert.match(text, /- missing test/);
   });
 
   console.log("index.ts — extension wiring + tool");
@@ -1839,13 +1477,15 @@ const main = async () => {
     assert.ok(commands.episteme, "missing command: /episteme");
     assert.ok(commands["episteme-on"], "missing command: /episteme-on");
     assert.ok(commands["episteme-off"], "missing command: /episteme-off");
-    assert.ok(
+    assert.equal(
       commands["episteme-orchestrate"],
-      "missing command: /episteme-orchestrate",
+      undefined,
+      "GVS orchestration command must be gone",
     );
-    assert.ok(
-      tools.episteme.parameters.properties.action.enum.includes("orchestrate"),
-      "missing tool action: orchestrate",
+    assert.deepEqual(
+      [...tools.episteme.parameters.properties.action.enum].sort(),
+      ["advance", "status"],
+      "the tool exposes advance/status only",
     );
     assert.ok(transformers.length >= 1, "missing markdown transformer");
   });
@@ -2037,7 +1677,7 @@ const main = async () => {
       ? content({}, plainTheme).render(width)
       : content;
 
-  await test("mode: off by default; /episteme-on enables it for the session only", async () => {
+  await test("state: off by default; /episteme-on enables it for the session only", async () => {
     const notifs = [];
     const widgets = {};
     const cmdCtx = {
@@ -2094,7 +1734,7 @@ const main = async () => {
       undefined,
       cmdCtx,
     );
-    assert.ok(s.content[0].text.includes("mode: off"));
+    assert.ok(s.content[0].text.includes("state: off"));
 
     // /episteme-on: session-scoped enable, no settings file is written
     const settingsBefore = readFileSync(projectSettings, "utf8");
@@ -2104,7 +1744,7 @@ const main = async () => {
       settingsBefore,
       "no settings file written",
     );
-    assert.deepEqual(renderWidget(widgets["episteme-mode"][0]), [" episteme  light"]);
+    assert.deepEqual(renderWidget(widgets["episteme-mode"][0]), [" episteme  on"]);
     assert.ok(notifs.some(([m, l]) => l === "info" && m.includes("enabled")));
 
     // episteme compaction and instructions come back
@@ -2128,14 +1768,14 @@ const main = async () => {
       undefined,
       cmdCtx,
     );
-    assert.ok(s2.content[0].text.includes("mode: light"));
+    assert.ok(s2.content[0].text.includes("state: on"));
 
     // a new session starts off again (the mode is not persisted)
     handlers.session_start[0]({ type: "session_start" }, cmdCtx);
     assert.deepEqual(renderWidget(widgets["episteme-mode"][0]), [" episteme  off"]);
   });
 
-  await test("episteme-on: light by default; idempotent when already on", async () => {
+  await test("episteme-on: idempotent when already on", async () => {
     const notifs = [];
     const cmdCtx = {
       ...tCtx,
@@ -2148,7 +1788,7 @@ const main = async () => {
     };
     await commands["episteme-on"].handler("", cmdCtx);
     await commands["episteme-on"].handler("", cmdCtx);
-    assert.ok(notifs.some((m) => m.includes("already on (light)")));
+    assert.ok(notifs.some((m) => m.includes("already on")));
     const s = await exec(
       "dis-4",
       { action: "status" },
@@ -2156,67 +1796,7 @@ const main = async () => {
       undefined,
       cmdCtx,
     );
-    assert.ok(s.content[0].text.includes("mode: light"));
-  });
-
-  await test("episteme-on: explicit strict; switches mode without /episteme-off", async () => {
-    handlers.session_start[0]({ type: "session_start" }, tCtx);
-    branch.length = 0; // empty session: the system prompt carries the mode
-    const notifs = [];
-    const cmdCtx = {
-      ...tCtx,
-      hasUI: true,
-      ui: {
-        notify: (msg) => notifs.push(msg),
-        setWidget: () => {},
-        confirm: async () => true,
-      },
-    };
-    await commands["episteme-on"].handler("strict", cmdCtx);
-    let s = await exec(
-      "switch-1",
-      { action: "status" },
-      undefined,
-      undefined,
-      cmdCtx,
-    );
-    assert.ok(s.content[0].text.includes("mode: strict"));
-    await commands["episteme-on"].handler("light", cmdCtx);
-    assert.ok(notifs.some((m) => m.includes("switched to light mode")));
-    s = await exec(
-      "switch-2",
-      { action: "status" },
-      undefined,
-      undefined,
-      cmdCtx,
-    );
-    assert.ok(s.content[0].text.includes("mode: light"));
-    const res = handlers.before_agent_start[0]({
-      type: "before_agent_start",
-      prompt: "hi",
-      systemPrompt: "BASE",
-      systemPromptOptions: {},
-    });
-    assert.ok(res.systemPrompt.includes("Light mode:"));
-  });
-
-  await test("episteme-on switch supersedes queued standing instructions", async () => {
-    handlers.session_start[0]({ type: "session_start" }, tCtx);
-    branch.length = 0;
-    branch.push(branchMsg("earlier work", "switch-defer"));
-    sentMessages.length = 0;
-    await commands["episteme-on"].handler("", tCtx);
-    assert.equal(sentMessages.length, 1, "activation queued for the next turn");
-    await commands["episteme-on"].handler("strict", tCtx);
-    assert.equal(sentMessages.length, 2, "superseding message queued");
-    assert.deepEqual(sentMessages[1].opts, { deliverAs: "nextTurn" });
-    assert.equal(sentMessages[1].msg.customType, "episteme-instructions");
-    assert.ok(sentMessages[1].msg.content.includes("Mode switched: light → strict"));
-    assert.ok(sentMessages[1].msg.content.includes("Strict mode:"));
-    // restore the default mode for the tests that follow
-    await commands["episteme-on"].handler("light", tCtx);
-    assert.equal(sentMessages.length, 3);
-    branch.length = 0;
+    assert.ok(s.content[0].text.includes("state: on"));
   });
 
   await test("episteme-on on an existing session defers the system prompt (KV-cache guard)", async () => {
@@ -2487,7 +2067,7 @@ implemented parser; files: src/parser.ts; tests green
     );
     assert.ok(!r.isError);
     assert.ok(r.content[0].text.includes("research: yes"));
-    assert.ok(r.content[0].text.includes("mode: light"));
+    assert.ok(r.content[0].text.includes("state: on"));
     assert.ok(r.content[0].text.includes("plan: 1/2"));
     assert.ok(r.content[0].text.includes("reports: [1]"));
   });
@@ -2702,7 +2282,7 @@ implemented parser; files: src/parser.ts; tests green
     branch.push(branchMsg("hello", "w3"));
     handlers.turn_end[0]({ type: "turn_end" }, ctx);
     assert.equal(lastSet("episteme")[1], undefined);
-    assert.deepEqual(renderWidget(lastSet("episteme-mode")[1]), [" episteme  light"]);
+    assert.deepEqual(renderWidget(lastSet("episteme-mode")[1]), [" episteme  on"]);
   });
 
   await test("turn_end widget: next label is the item part before the first colon", async () => {
@@ -2913,68 +2493,7 @@ implemented parser; files: src/parser.ts; tests green
     await clearPending();
   });
 
-  await test("orchestrate needs strict mode; light and off are refused (tool and command)", async () => {
-    const notes = [];
-    const ctx = {
-      ...tCtx,
-      hasUI: true,
-      waitForIdle: async () => {},
-      ui: {
-        notify: (message, level) => notes.push([message, level]),
-        setWidget: () => {},
-      },
-    };
-    branch.length = 0;
-    handlers.session_start[0]({ type: "session_start" }, ctx); // mode off
-    const off = await exec(
-      "orch-off",
-      { action: "orchestrate", task: "do it" },
-      undefined,
-      undefined,
-      ctx,
-    );
-    assert.ok(off.isError, "orchestrate must not run with the mode off");
-    assert.match(off.content[0].text, /pi-episteme is disabled/);
-    notes.length = 0;
-    await commands["episteme-orchestrate"].handler("do it", ctx);
-    assert.ok(
-      notes.some(([m, level]) => level === "error" && m.includes("disabled")),
-      "the command is gated too",
-    );
-    // Enabled in light mode: the agent works alone here, so a GVS run is
-    // refused with an error that names the way to enable it.
-    await commands["episteme-on"].handler("light", ctx);
-    const light = await exec(
-      "orch-light",
-      { action: "orchestrate", task: "do it" },
-      undefined,
-      undefined,
-      ctx,
-    );
-    assert.ok(light.isError, "light mode must not run GVS orchestration");
-    assert.match(light.content[0].text, /strict-mode only/);
-    notes.length = 0;
-    await commands["episteme-orchestrate"].handler("do it", ctx);
-    assert.ok(
-      notes.some(
-        ([m, level]) => level === "error" && m.includes("strict-mode only"),
-      ),
-      "the command honours the mode gate too",
-    );
-    // Strict: a different error proves the mode gate was passed.
-    await commands["episteme-on"].handler("strict", ctx);
-    const noModel = await exec(
-      "orch-model",
-      { action: "orchestrate", task: "do it" },
-      undefined,
-      undefined,
-      ctx,
-    );
-    assert.ok(noModel.isError);
-    assert.match(noModel.content[0].text, /no model selected/);
-  });
-
-  await test("/episteme abort, unknown subcommand, headless reset all speak up", async () => {
+  await test("/episteme unknown subcommand and headless reset both speak up", async () => {
     const notes = [];
     const ctx = {
       ...tCtx,
@@ -2984,9 +2503,6 @@ implemented parser; files: src/parser.ts; tests green
         setWidget: () => {},
       },
     };
-    await commands.episteme.handler("abort", ctx);
-    assert.ok(notes.some(([m]) => m.includes("no orchestration is running")));
-    notes.length = 0;
     await commands.episteme.handler("comapct", ctx);
     assert.ok(
       notes.some(
@@ -3114,60 +2630,7 @@ implemented parser; files: src/parser.ts; tests green
     );
   });
 
-  await test("worker approval bridge: read-only passes, everything else asks", async () => {
-    const { workerApprovalBridge } = await jiti.import(join(here, "index.ts"));
-    const asked = [];
-    const choices = ["Block this call", "Allow all tools for this run"];
-    let next = 0;
-    const parent = {
-      hasUI: true,
-      ui: {
-        notify: () => {},
-        confirm: async () => true,
-        select: async (title) => {
-          asked.push(title);
-          return choices[Math.min(next++, choices.length - 1)];
-        },
-      },
-    };
-    const state = { approvedAll: false, announcedNoUI: false };
-    const h = {};
-    workerApprovalBridge(parent, state)({ on: (name, handler) => (h[name] = handler) });
-    const blocked = await h.tool_call({
-      type: "tool_call",
-      toolCallId: "t1",
-      toolName: "bash",
-      input: { command: "rm -rf build" },
-    });
-    assert.equal(blocked?.block, true, "bash is blocked until the user says yes");
-    assert.equal(asked.length, 1);
-    assert.equal(
-      await h.tool_call({ type: "tool_call", toolCallId: "t2", toolName: "read", input: {} }),
-      undefined,
-    );
-    assert.equal(asked.length, 1, "read-only tools never interrupt");
-    assert.equal(
-      await h.tool_call({ type: "tool_call", toolCallId: "t3", toolName: "edit", input: {} }),
-      undefined,
-    );
-    assert.equal(asked.length, 2);
-    assert.equal(state.approvedAll, true);
-    await h.tool_call({ type: "tool_call", toolCallId: "t4", toolName: "write", input: {} });
-    assert.equal(asked.length, 2, "the run-level allowance is remembered");
-    // headless: impossible to ask -> say it once, do not pretend to be gated
-    const said = [];
-    const h2 = {};
-    workerApprovalBridge(
-      { hasUI: false, ui: { notify: (m) => said.push(m), select: async () => "x", confirm: async () => true } },
-      { approvedAll: false, announcedNoUI: false },
-    )({ on: (name, handler) => (h2[name] = handler) });
-    await h2.tool_call({ type: "tool_call", toolCallId: "t5", toolName: "bash", input: {} });
-    await h2.tool_call({ type: "tool_call", toolCallId: "t6", toolName: "bash", input: {} });
-    assert.equal(said.length, 1);
-    assert.match(said[0], /unattended/);
-  });
-
-  await test("light/off/pause/resume and degraded auto-continuation", async () => {
+  await test("off/on/pause/resume and degraded auto-continuation", async () => {
     const notes = [];
     const ctx = {
       ...tCtx,
@@ -3177,14 +2640,14 @@ implemented parser; files: src/parser.ts; tests green
     };
     branch.length = 0;
     handlers.session_start[0]({ type: "session_start" }, ctx);
-    await commands["episteme-on"].handler("light", ctx);
+    await commands["episteme-on"].handler("", ctx);
     const instructions = handlers.before_agent_start[0]({
       type: "before_agent_start",
       prompt: "hi",
       systemPrompt: "BASE",
       systemPromptOptions: {},
     });
-    assert.ok(instructions.systemPrompt.includes("Light mode"));
+    assert.ok(instructions.systemPrompt.includes("PI-EPISTEME"));
     await commands.episteme.handler("pause", ctx);
 
     branch.length = 0;
@@ -3200,7 +2663,7 @@ implemented parser; files: src/parser.ts; tests green
     requested.onError(new Error("Nothing to compact (session too small)"));
     assert.equal(continuedMessages.length, 0, "pause suppresses degraded continuation");
     const deferredStatus = await exec("defer-status", { action: "status" }, undefined, undefined, ctx);
-    assert.ok(deferredStatus.content[0].text.includes("mode: light (paused)"));
+    assert.ok(deferredStatus.content[0].text.includes("state: paused"));
     assert.ok(deferredStatus.content[0].text.includes("deferred=1"));
     assert.ok(deferredStatus.content[0].text.includes("pending: none"));
 
@@ -3223,9 +2686,9 @@ implemented parser; files: src/parser.ts; tests green
     assert.ok(notes.some(([message]) => message.includes("disabled for this session")));
   });
 
-  await test("light: degraded plan continuation queues the next item for the agent", async () => {
+  await test("degraded plan continuation queues the next item for the agent", async () => {
     handlers.session_start[0]({ type: "session_start" }, tCtx);
-    await commands["episteme-on"].handler("light", tCtx);
+    await commands["episteme-on"].handler("", tCtx);
     branch.length = 0;
     branch.push(branchMsg(`${R}\n${PLAN1}`, "defer-auto"));
     continuedMessages.length = 0;
@@ -3241,7 +2704,7 @@ implemented parser; files: src/parser.ts; tests green
     assert.ok(continuedMessages[0].includes("execute 1"));
   });
 
-  await test("strict: leftover items are reported, never auto-queued for manual work", async () => {
+  await test("an unfinished plan auto-continues in this session", async () => {
     const notes = [];
     const ctx = {
       ...tCtx,
@@ -3249,13 +2712,12 @@ implemented parser; files: src/parser.ts; tests green
       ui: { notify: (message, level) => notes.push([message, level]), setWidget: () => {} },
     };
     handlers.session_start[0]({ type: "session_start" }, ctx);
-    await commands["episteme-on"].handler("strict", ctx);
+    await commands["episteme-on"].handler("", ctx);
     branch.length = 0;
-    branch.push(branchMsg(`${R}\n${PLAN1}`, "defer-strict"));
+    branch.push(branchMsg(`${R}\n${PLAN1}`, "defer-on"));
     continuedMessages.length = 0;
-    notes.length = 0;
-    const accepted = await exec("defer-strict-1", { action: "advance" }, undefined, undefined, ctx);
-    assert.ok(!accepted.isError, "manual advance still works in strict mode");
+    const accepted = await exec("defer-on-1", { action: "advance" }, undefined, undefined, ctx);
+    assert.ok(!accepted.isError);
     let requested;
     await handlers.agent_settled[0]({ type: "agent_settled" }, {
       ...ctx,
@@ -3264,16 +2726,8 @@ implemented parser; files: src/parser.ts; tests green
     requested.onError(new Error("Nothing to compact (session too small)"));
     assert.equal(
       continuedMessages.length,
-      0,
-      "strict mode must not queue 'go execute this item' at the main agent",
-    );
-    assert.ok(
-      notes.some(
-        ([message]) =>
-          message.includes("still unreported") &&
-          message.includes('episteme(action="orchestrate")'),
-      ),
-      "the user is told how to continue the item",
+      1,
+      "the session's own agent is told to continue with the next item",
     );
   });
 

@@ -1,10 +1,10 @@
 {
   "name": "pi-episteme",
   "version": "0.2.0",
-  "description": "Context-aware agent orchestration for pi-coding-agent with local LLMs: layered KV-cache-friendly context (research → plan → steps) plus a file-less GVS-style pipeline (Manager → Workers → Verifier) with a byte-stable prompt prefix.",
+  "description": "Advanced context compaction for pi-coding-agent: a phased plan pipeline (research → plan → steps) with a byte-stable prompt prefix and KV-cache reuse for local LLMs.",
   "type": "module",
   "license": "MIT",
-  "keywords": ["pi-package", "pi", "pi-coding-agent", "context", "compaction", "orchestration", "multi-agent", "kv-cache", "llm"],
+  "keywords": ["pi-package", "pi", "pi-coding-agent", "context", "compaction", "plan", "kv-cache", "llm"],
   "homepage": "https://github.com/maxsintsov1996-netizen/pi-episteme#readme",
   "bugs": {
     "url": "https://github.com/maxsintsov1996-netizen/pi-episteme/issues"
@@ -31,8 +31,6 @@
     "prompts.ts",
     "compaction.ts",
     "config.ts",
-    "context.ts",
-    "orchestrator.ts",
     "check.cjs",
     "local-check.cjs",
     "README.md",
