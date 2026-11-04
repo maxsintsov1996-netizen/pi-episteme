@@ -577,8 +577,8 @@ const main = async () => {
 
   const makeEvent = (opts = {}) => ({
     type: "session_before_compact",
-    reason: "manual",
-    willRetry: false,
+    reason: opts.reason ?? "manual",
+    willRetry: opts.willRetry ?? false,
     customInstructions: "test",
     signal: opts.signal ?? new AbortController().signal,
     branchEntries: opts.branchEntries ?? [
@@ -2729,6 +2729,191 @@ implemented parser; files: src/parser.ts; tests green
       1,
       "the session's own agent is told to continue with the next item",
     );
+  });
+
+  // pi's threshold check runs between turns — after the advance tool result is
+  // appended, before the run settles. It then performs the phase compaction
+  // itself, and the continuation that rode on the extension's own request must
+  // survive the phase request being consumed.
+  const owePhase = async (ctx, id) => {
+    branch.length = 0;
+    branch.push({
+      type: "compaction",
+      id: `c-${id}`,
+      summary: episteme.buildEpistemeSummary({
+        research: "stack: node",
+        plan: "- [ ] write parser\n- [ ] add tests",
+      }),
+    });
+    branch.push(
+      branchMsg(
+        `/*EPISTEME::STEP-1::v1*/\nparser landed\n/*EPISTEME::END::STEP-1::v1*/`,
+        `b-${id}`,
+      ),
+    );
+    const accepted = await exec(
+      `owed-${id}`,
+      { action: "advance", step: 1 },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.ok(!accepted.isError, accepted.content[0].text);
+    return handlers.session_before_compact[0](
+      makeEvent({
+        reason: "threshold",
+        messages: [
+          assistantMsg(
+            `${PLAN1_DONE}\n/*EPISTEME::STEP-1::v1*/\nparser landed\n/*EPISTEME::END::STEP-1::v1*/`,
+          ),
+        ],
+      }),
+      ctx,
+    );
+  };
+
+  const enabledCtx = () => {
+    const ctx = {
+      ...tCtx,
+      hasUI: true,
+      ui: { notify: () => {}, setWidget: () => {} },
+    };
+    handlers.session_start[0]({ type: "session_start" }, ctx);
+    return ctx;
+  };
+
+  // A second compaction request after the phase was already closed is a bug:
+  // it would pay for the same phase twice, so the harness refuses one.
+  const noCompact = (ctx) => ({
+    ...ctx,
+    compact: () => {
+      throw new Error("no second compaction expected for a closed phase");
+    },
+  });
+
+  await test("a phase compaction run by pi's threshold check queues the continuation", async () => {
+    const ctx = enabledCtx();
+    await commands["episteme-on"].handler("", ctx);
+    const res = await owePhase(ctx, "threshold");
+    assert.equal(res.compaction.details.episteme.mode, "step");
+    assert.equal(res.compaction.details.episteme.stepId, "1");
+    continuedMessages.length = 0;
+    await handlers.agent_settled[0]({ type: "agent_settled" }, noCompact(ctx));
+    assert.equal(continuedMessages.length, 1, "the owed continuation is delivered");
+    assert.match(String(continuedMessages[0]), /add tests/);
+    // a further settle must not repeat it
+    continuedMessages.length = 0;
+    await handlers.agent_settled[0]({ type: "agent_settled" }, noCompact(ctx));
+    assert.equal(continuedMessages.length, 0);
+  });
+
+  await test("an overflow compaction of a closed phase queues the continuation", async () => {
+    const ctx = enabledCtx();
+    await commands["episteme-on"].handler("", ctx);
+    branch.length = 0;
+    branch.push({
+      type: "compaction",
+      id: "c-overflow",
+      summary: episteme.buildEpistemeSummary({
+        research: "stack: node",
+        plan: "- [ ] write parser\n- [ ] add tests",
+      }),
+    });
+    branch.push(
+      branchMsg(
+        `/*EPISTEME::STEP-1::v1*/\nparser landed\n/*EPISTEME::END::STEP-1::v1*/`,
+        "b-overflow",
+      ),
+    );
+    const accepted = await exec(
+      "overflow-1",
+      { action: "advance", step: 1 },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.ok(!accepted.isError);
+    const res = await handlers.session_before_compact[0](
+      makeEvent({
+        reason: "overflow",
+        willRetry: true,
+        messages: [
+          assistantMsg(
+            `${PLAN1_DONE}\n/*EPISTEME::STEP-1::v1*/\nparser landed\n/*EPISTEME::END::STEP-1::v1*/`,
+          ),
+        ],
+      }),
+      ctx,
+    );
+    assert.equal(res.compaction.details.episteme.mode, "step");
+    continuedMessages.length = 0;
+    await handlers.agent_settled[0]({ type: "agent_settled" }, noCompact(ctx));
+    assert.equal(continuedMessages.length, 1);
+    assert.match(String(continuedMessages[0]), /add tests/);
+  });
+
+  await test("the extension's own phase compaction queues exactly one continuation", async () => {
+    const ctx = enabledCtx();
+    await commands["episteme-on"].handler("", ctx);
+    branch.length = 0;
+    branch.push({
+      type: "compaction",
+      id: "c-own",
+      summary: episteme.buildEpistemeSummary({
+        research: "stack: node",
+        plan: "- [ ] write parser\n- [ ] add tests",
+      }),
+    });
+    branch.push(
+      branchMsg(
+        `/*EPISTEME::STEP-1::v1*/\nparser landed\n/*EPISTEME::END::STEP-1::v1*/`,
+        "b-own",
+      ),
+    );
+    const accepted = await exec(
+      "own-1",
+      { action: "advance", step: 1 },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.ok(!accepted.isError);
+    continuedMessages.length = 0;
+    let requested;
+    await handlers.agent_settled[0]({ type: "agent_settled" }, {
+      ...ctx,
+      compact: (options) => {
+        requested = options;
+      },
+    });
+    // pi runs the request: the handler consumes the phase, then it completes.
+    const res = await handlers.session_before_compact[0](
+      makeEvent({
+        messages: [
+          assistantMsg(
+            `${PLAN1_DONE}\n/*EPISTEME::STEP-1::v1*/\nparser landed\n/*EPISTEME::END::STEP-1::v1*/`,
+          ),
+        ],
+      }),
+      ctx,
+    );
+    assert.equal(res.compaction.details.episteme.mode, "step");
+    requested.onComplete({});
+    assert.equal(continuedMessages.length, 1, "one continue message per phase");
+    await handlers.agent_settled[0]({ type: "agent_settled" }, noCompact(ctx));
+    assert.equal(continuedMessages.length, 1, "no duplicate from the leftover flag");
+  });
+
+  await test("/episteme-off drops a continuation owed to a consumed phase", async () => {
+    const ctx = enabledCtx();
+    await commands["episteme-on"].handler("", ctx);
+    await owePhase(ctx, "off");
+    await commands["episteme-off"].handler(undefined, ctx);
+    continuedMessages.length = 0;
+    await handlers.agent_settled[0]({ type: "agent_settled" }, ctx);
+    assert.equal(continuedMessages.length, 0, "a disabled mode queues nothing");
+    // restore the off default for the tests that follow
+    handlers.session_start[0]({ type: "session_start" }, tCtx);
   });
 
   rmSync(workDir, { recursive: true, force: true });

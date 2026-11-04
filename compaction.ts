@@ -51,6 +51,14 @@ export interface EpistemeRuntime {
     boundaryId?: string;
   } | null;
   layerTokenBudget?: number;
+  /**
+   * A phase request (plan/step) was consumed by a compaction, so the phase is
+   * closed and the next plan item is owed to the model. pi can run the phase
+   * compaction itself (its threshold check fires between turns, before the run
+   * settles), in which case the extension never gets to queue the continuation
+   * — it must not be lost with `pending`. Cleared once delivered.
+   */
+  continueOwed?: boolean;
   ensureBoundary?: (ctx: ExtensionContext) => string;
 }
 
@@ -461,7 +469,14 @@ export async function handleSessionBeforeCompact(
     },
   };
 
-  if (rt.pending) rt.pending = null;
+  if (rt.pending) {
+    // A phase compaction is done, whoever triggered it. If pi's own
+    // threshold/overflow check got here first, the extension's end-of-turn
+    // request (and the auto-continue it carries) never runs — leave the
+    // continuation behind for `agent_settled`.
+    if (mode !== "plain") rt.continueOwed = true;
+    rt.pending = null;
+  }
   return {
     compaction: {
       summary,

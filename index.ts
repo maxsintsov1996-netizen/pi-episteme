@@ -513,6 +513,14 @@ export default function (pi: ExtensionAPI) {
     }
   };
 
+  // Drop a pending phase request together with any continuation it left
+  // behind: a stale flag would queue a plan step for a phase that no longer
+  // exists (mode off, session restart, hard compaction failure).
+  const dropPending = (): void => {
+    rt.pending = null;
+    rt.continueOwed = false;
+  };
+
   const requestCompact = (
     ctx: ExtensionContext,
     customInstructions: string,
@@ -525,6 +533,9 @@ export default function (pi: ExtensionAPI) {
       customInstructions,
       onComplete: () => {
         deferredReason = undefined;
+        // This request delivered its own continuation through onDone; keep
+        // agent_settled from queueing a second one for the same phase.
+        rt.continueOwed = false;
         if (ctx.hasUI) ctx.ui.notify("pi-episteme: compaction finished", "info");
         onDone?.();
       },
@@ -541,7 +552,7 @@ export default function (pi: ExtensionAPI) {
             );
           return;
         }
-        rt.pending = null;
+        dropPending();
         if (continueOnError && !cancelled) {
           deferredReason = err.message;
           stats.deferred += 1;
@@ -573,7 +584,7 @@ export default function (pi: ExtensionAPI) {
     hideAnchors = s.hideAnchors;
 
     rt.epistemeDir = resolveEpistemeDir(ctx);
-    rt.pending = null;
+    dropPending();
     rt.layerTokenBudget = s.layerTokenBudget;
     compactOurs = false;
     deferredReason = undefined;
@@ -651,7 +662,7 @@ export default function (pi: ExtensionAPI) {
     if (!enabled) {
       // Disabled: fall back to pi's default compaction. Drop any stale
       // phase request so it cannot be consumed by a later compaction.
-      rt.pending = null;
+      dropPending();
       return;
     }
     const result = await handleSessionBeforeCompact(event, ctx, rt);
@@ -662,16 +673,27 @@ export default function (pi: ExtensionAPI) {
   pi.on("agent_settled", (_event, ctx) => {
     if (!rt.epistemeDir) rt.epistemeDir = resolveEpistemeDir(ctx);
     const pending = rt.pending;
-    if (!pending) return;
+    if (!pending) {
+      // pi's own threshold/overflow compaction can consume the phase request
+      // mid-run: its check runs between turns, before the run settles, and the
+      // handler performs the phase compaction (boundary as the kept cut) that
+      // this handler would have requested. The continuation rode on that
+      // request, so deliver it here instead of losing the pipeline step.
+      if (rt.continueOwed) {
+        rt.continueOwed = false;
+        if (enabled && autoContinue) autoContinueNext(ctx);
+      }
+      return;
+    }
     if (!enabled) {
       // Disabled mid-phase: drop the request, no episteme compaction.
-      rt.pending = null;
+      dropPending();
       return;
     }
     try {
       if (!pending.boundaryId) rt.ensureBoundary?.(ctx);
     } catch (err) {
-      rt.pending = null;
+      dropPending();
       if (ctx.hasUI)
         ctx.ui.notify(
           `pi-episteme: could not create a phase boundary: ${err instanceof Error ? err.message : String(err)}`,
@@ -832,7 +854,7 @@ export default function (pi: ExtensionAPI) {
       enabled = true;
       paused = false;
       deferredReason = undefined;
-      rt.pending = null;
+      dropPending();
       // KV-cache guard: in a session that already carries context, changing the
       // system prompt now would invalidate the cached prefix, so the layer-0
       // instructions ride on an injected message until the next compaction.
@@ -870,7 +892,7 @@ export default function (pi: ExtensionAPI) {
       paused = false;
       deferSystemPrompt = false;
       deferredReason = undefined;
-      rt.pending = null;
+      dropPending();
       if (hadContext)
         pi.sendMessage(
           {

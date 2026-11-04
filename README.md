@@ -128,9 +128,13 @@ layers are filtered.
 ## Auto-continue and UI
 
 `autoContinue` is on by default. After advance processing, including explicit
-degraded continuation, it queues the next unfinished plan item. `/episteme pause`
-suppresses only auto-continue, not execution or compaction; `/episteme resume`
-re-enables it and queues the next item when idle.
+degraded continuation, it queues the next unfinished plan item. Pi checks its own
+threshold between turns — right after a tool result is appended, before the run
+settles — so a threshold or overflow compaction can close the phase first; the
+continuation is then kept as a debt and queued at the next settle instead of
+disappearing with the consumed phase request. `/episteme pause` suppresses only
+auto-continue, not execution or compaction; `/episteme resume` re-enables it and
+queues the next item when idle.
 
 The TUI shows plan progress, or the current on/off/paused state while there is
 no plan to show.
