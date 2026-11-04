@@ -1,6 +1,6 @@
 {
   "name": "pi-episteme",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Advanced context compaction for pi-coding-agent: a phased plan pipeline (research → plan → steps) with a byte-stable prompt prefix and KV-cache reuse for local LLMs.",
   "type": "module",
   "license": "MIT",

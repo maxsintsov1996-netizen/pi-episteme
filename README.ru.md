@@ -155,12 +155,12 @@ TUI показывает прогресс плана либо состояние
 
 ```bash
 # из git (зафиксированный ref):
-pi install git:github.com/maxsintsov1996-netizen/pi-episteme@v0.2.0
+pi install git:github.com/maxsintsov1996-netizen/pi-episteme@v0.3.0
 # или из локального каталога:
 pi install /path/to/pi-episteme
 ```
 
-> npm: `pi install npm:pi-episteme` заработает после публикации v0.2.0 в
+> npm: `pi install npm:pi-episteme` заработает после публикации v0.3.0 в
 > реестре. На момент написания пакета в реестре не было (`npm view pi-episteme`
 > отвечает 404), поэтому документированный путь — git или локальный каталог.
 

@@ -148,12 +148,12 @@ neither proves that a KV-cache hit occurred.
 
 ```bash
 # from git (pinned ref):
-pi install git:github.com/maxsintsov1996-netizen/pi-episteme@v0.2.0
+pi install git:github.com/maxsintsov1996-netizen/pi-episteme@v0.3.0
 # or from a local checkout:
 pi install /path/to/pi-episteme
 ```
 
-> npm: `pi install npm:pi-episteme` works once v0.2.0 is published to the
+> npm: `pi install npm:pi-episteme` works once v0.3.0 is published to the
 > registry. The npm release had not been published at the time of writing —
 > `npm view pi-episteme` answers 404 — so git/local install is the documented
 > path.
