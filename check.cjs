@@ -709,7 +709,7 @@ const main = async () => {
       makeRt(null),
     );
     assert.ok(res?.compaction);
-    assert.deepEqual(res.compaction.details.episteme.reportFiles, [1]);
+    assert.deepEqual(res.compaction.details.episteme.reportIds, ["1"]);
     assert.ok(
       res.compaction.summary.includes("did write parser; tests green"),
     );
@@ -763,7 +763,7 @@ const main = async () => {
     assert.ok(
       res.compaction.summary.includes("- [ ] build\n- [ ] test\n- [ ] ship"),
     );
-    assert.deepEqual(res.compaction.details.episteme.reportFiles, []);
+    assert.deepEqual(res.compaction.details.episteme.reportIds, []);
   });
 
   await test("previousLlmTail: strips the episteme prefix, keeps the pi LLM tail", () => {
@@ -1151,6 +1151,60 @@ const main = async () => {
     );
   });
 
+  await test("milestone rollover: each epoch archives only the IDs it closed", async () => {
+    const previousSummary = episteme.buildEpistemeSummary({
+      research: "research",
+      plan: "- [id:S1] first\n- [id:S2] second",
+      reports: [{ key: "S1", text: "full first report" }],
+    });
+    const first = await handleSessionBeforeCompact(
+      makeEvent({ previousSummary, messages: [assistantMsg("done")] }),
+      makeCtx(),
+      { ...makeRt({ kind: "step", stepId: "S1" }), layerTokenBudget: 1 },
+      { summarizeMilestone: async () => "digest one" },
+    );
+    assert.equal(first.compaction.details.episteme.epoch, 1);
+
+    // The next epoch starts from the summary pi just saved, with S2 reported.
+    const second = await handleSessionBeforeCompact(
+      makeEvent({
+        previousSummary: first.compaction.summary,
+        messages: [assistantMsg(episteme.epistemeBlock("STEP-S2", "full second report"))],
+      }),
+      makeCtx(),
+      { ...makeRt(null), layerTokenBudget: 1 },
+      { summarizeMilestone: async () => "digest two" },
+    );
+    const summary = second.compaction.summary;
+    assert.ok(summary.includes("MILESTONE-1") && summary.includes("MILESTONE-2"));
+    const idLists = [...summary.matchAll(/^Completed-Steps: (.*)$/gm)].map((m) => m[1].trim());
+    // A cumulative list re-paid every earlier epoch in every later one.
+    assert.deepEqual(idLists, ["S1", "S2"]);
+    // and progress still sees the whole history through the union
+    const layers = episteme.extractLayers(summary);
+    assert.deepEqual(
+      [...episteme.completedStepIds(layers.reports, layers.milestones)].sort(),
+      ["S1", "S2"],
+    );
+  });
+
+  await test("pruneSnapshots keeps only the newest raw snapshots", () => {
+    const dir = mkdtempSync(join(tmpdir(), "pi-episteme-snaps-"));
+    const { utimesSync } = require("node:fs");
+    for (const name of ["step_1_raw.md", "step_2_raw.md", "epoch_1_layers.md"]) {
+      writeFileSync(join(dir, name), "x");
+    }
+    const past = (Date.now() - 60000) / 1000;
+    utimesSync(join(dir, "step_1_raw.md"), past, past);
+    utimesSync(join(dir, "step_2_raw.md"), past + 10, past + 10);
+    assert.equal(episteme.pruneSnapshots(dir, 2), 1, "the oldest dump goes");
+    assert.ok(!existsSync(join(dir, "step_1_raw.md")));
+    assert.ok(existsSync(join(dir, "step_2_raw.md")));
+    assert.ok(existsSync(join(dir, "epoch_1_layers.md")));
+    assert.equal(episteme.pruneSnapshots(join(dir, "no-such-dir"), 5), 0);
+    rmSync(dir, { recursive: true, force: true });
+  });
+
   await test("plain compaction does not pay twice for a block the tail keeps", async () => {
     const layers = {
       research: "research body",
@@ -1351,6 +1405,35 @@ const main = async () => {
       assert.equal(
         config.resolveEpistemeSettings(workDir, globalSettings).layerTokenBudget,
         256,
+      );
+    });
+
+    await test("layer budget: one validity rule for settings and environment", () => {
+      clearEpistemeEnv();
+      // One rule for both sources: a whole number >= 0 that stays a safe integer.
+      assert.equal(config.normalizeLayerTokenBudget(0), 0);
+      assert.equal(config.normalizeLayerTokenBudget("4096"), 4096);
+      assert.equal(config.normalizeLayerTokenBudget(-1), undefined);
+      assert.equal(config.normalizeLayerTokenBudget(1.5), undefined);
+      assert.equal(
+        config.normalizeLayerTokenBudget("99999999999999999999"),
+        undefined,
+      );
+      assert.equal(config.normalizeLayerTokenBudget("many"), undefined);
+      assert.equal(config.normalizeLayerTokenBudget(null), undefined);
+      assert.equal(config.normalizeLayerTokenBudget(undefined), undefined);
+      // the settings file goes through the same rule: junk falls through to the
+      // default instead of being trusted as a budget
+      writeSettings(projectSettings, {});
+      writeSettings(globalSettings, { piEpisteme: { layerTokenBudget: "lots" } });
+      assert.equal(
+        config.resolveEpistemeSettings(workDir, globalSettings).layerTokenBudget,
+        16384,
+      );
+      writeSettings(globalSettings, { piEpisteme: { layerTokenBudget: 320 } });
+      assert.equal(
+        config.resolveEpistemeSettings(workDir, globalSettings).layerTokenBudget,
+        320,
       );
     });
 

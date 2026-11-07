@@ -300,6 +300,29 @@ export function completedStepIds(
   return completed;
 }
 
+/**
+ * The IDs a rollover archives in a NEW milestone: the reported IDs that no
+ * earlier MILESTONE already covers. Progress, step unlocking and completed-item
+ * immutability all read `completedStepIds`, which unions every milestone, so a
+ * per-epoch list loses nothing — while a cumulative one re-paid the same IDs in
+ * every later epoch (quadratic growth of the permanent layer).
+ */
+export function newlyArchivedStepIds(
+  reports: readonly ReportRef[] = [],
+  milestones: readonly MilestoneRef[] = [],
+): string[] {
+  const alreadyArchived = completedStepIds([], milestones);
+  const seen = new Set<string>();
+  const ids: string[] = [];
+  for (const report of reports) {
+    const key = reportKey(report);
+    if (alreadyArchived.has(key) || seen.has(key)) continue;
+    seen.add(key);
+    ids.push(key);
+  }
+  return ids;
+}
+
 export function reportPlanCounts(
   md: string,
   reports: readonly ReportRef[],
@@ -473,6 +496,46 @@ export function writeSnapshot(path: string, title: string, body: string): void {
   ensureDir(dirname(path));
   const text = normalizeText(body);
   writeFileSync(path, `# Raw context snapshot — ${title}\n${SEP}${text}\n`, "utf8");
+}
+
+/**
+ * Keep the newest `keep` snapshot files in `dir` and delete the rest, so a long
+ * session cannot fill the disk with raw context dumps. A snapshot is a full
+ * serialized span, so one per step is unbounded without this. `/episteme reset`
+ * remains the way to clear everything at once.
+ */
+export function pruneSnapshots(dir: string, keep: number): number {
+  if (!Number.isFinite(keep) || keep < 0) return 0;
+  let entries: string[];
+  try {
+    entries = readdirSync(dir);
+  } catch {
+    return 0;
+  }
+  const files: { path: string; mtimeMs: number }[] = [];
+  for (const entry of entries) {
+    const full = join(dir, entry);
+    try {
+      const st = statSync(full);
+      if (!st.isFile()) continue;
+      files.push({ path: full, mtimeMs: st.mtimeMs });
+    } catch {
+      // Gone or unreadable: never fatal for a cleanup pass.
+    }
+  }
+  if (files.length <= keep) return 0;
+  // Name breaks mtime ties (same-millisecond writes are ordered by name).
+  files.sort((a, b) => b.mtimeMs - a.mtimeMs || (a.path < b.path ? 1 : -1));
+  let removed = 0;
+  for (const file of files.slice(keep)) {
+    try {
+      rmSync(file.path, { force: true });
+      removed += 1;
+    } catch {
+      // Ignore: bounded cleanup is best-effort.
+    }
+  }
+  return removed;
 }
 
 // ---------------------------------------------------------------------------

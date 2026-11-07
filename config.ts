@@ -110,13 +110,9 @@ export function readPiEpistemeConfig(
   if (typeof s.hideAnchors === "boolean") {
    merged.hideAnchors = s.hideAnchors;
   }
-  if (
-   typeof s.layerTokenBudget === "number" &&
-   Number.isFinite(s.layerTokenBudget) &&
-   Number.isInteger(s.layerTokenBudget) &&
-   s.layerTokenBudget >= 0
-  ) {
-   merged.layerTokenBudget = s.layerTokenBudget;
+  const budget = normalizeLayerTokenBudget(s.layerTokenBudget);
+  if (budget !== undefined) {
+   merged.layerTokenBudget = budget;
   }
  }
  return merged;
@@ -146,14 +142,31 @@ function resolveHideAnchors(cfgHide: boolean | undefined): boolean {
  return EPISTEME_DEFAULTS.hideAnchors;
 }
 
+/**
+ * One validity rule for `layerTokenBudget`, shared by the settings-file and
+ * environment paths: a whole number >= 0 that survives as a safe integer.
+ * "99999999999999999999" is an integer (1e20) and would silently act as
+ * "rollover disabled", so the range check matters as much as the shape check.
+ */
+export function normalizeLayerTokenBudget(value: unknown): number | undefined {
+ if (typeof value === "number") {
+  return Number.isSafeInteger(value) && value >= 0 ? value : undefined;
+ }
+ if (typeof value === "string") {
+  const text = value.trim();
+  if (!/^\d+$/.test(text)) return undefined;
+  const parsed = Number(text);
+  return Number.isSafeInteger(parsed) ? parsed : undefined;
+ }
+ return undefined;
+}
+
 /** Resolve the effective layerTokenBudget: env > config > default. */
 function resolveLayerTokenBudget(cfgBudget: number | undefined): number {
- const envBudget = envValue(ENV.layerTokenBudget)?.trim();
- if (envBudget !== undefined && /^\d+$/.test(envBudget)) {
-  const value = Number(envBudget);
-  // Safe-integer, not just integer: "99999999999999999999" is an integer
-  // (1e20) and would silently act as "rollover disabled".
-  if (Number.isSafeInteger(value)) {
+ const envBudget = envValue(ENV.layerTokenBudget);
+ if (envBudget !== undefined) {
+  const value = normalizeLayerTokenBudget(envBudget);
+  if (value !== undefined) {
    return value;
   }
  }

@@ -23,12 +23,13 @@ import {
   EPISTEME_VERSION,
   buildMilestoneText,
   buildEpistemeSummary,
-  completedStepIds,
   epistemeSummaryBlocks,
   estimateTextTokens,
   extractLayers,
+  newlyArchivedStepIds,
   normalizeText,
   epistemePaths,
+  pruneSnapshots,
   stripEpistemeBlocks,
   writeSnapshot,
   type EpistemeLayers,
@@ -39,6 +40,8 @@ type ConversationMessage = Preparation["messagesToSummarize"][number];
 type LlmResult = Pick<CompactionResult, "summary" | "usage">;
 
 const FALLBACK_TAIL_CHARS = 12000;
+/** Raw snapshots kept in `tmp/` (step spans and epoch layer archives). */
+const SNAPSHOT_KEEP = 24;
 const FALLBACK_HEADER =
   "## PI-EPISTEME RAW CHECKPOINT\nLLM summarization unavailable. This bounded raw tail preserves interrupted work; older discarded logs are omitted.";
 
@@ -68,7 +71,6 @@ export interface EpistemeDetails {
     version: string;
     stepN?: number;
     stepId?: string;
-    reportFiles: number[];
     reportIds: string[];
     llmSummary: boolean;
     rawFallback: boolean;
@@ -139,6 +141,17 @@ async function runPiSummary(
 
 const defaultPlainSummarizer: PlainSummarizer = (preparation, ctx, signal) =>
   runPiSummary(preparation, PLAIN_FOCUS, ctx, signal);
+
+/** Write a raw snapshot, then keep `tmp/` bounded (one dump per step is not). */
+function writeRawSnapshot(
+  dir: string,
+  fileName: string,
+  title: string,
+  body: string,
+): void {
+  writeSnapshot(join(epistemePaths(dir).tmp, fileName), title, body);
+  pruneSnapshots(epistemePaths(dir).tmp, SNAPSHOT_KEEP);
+}
 
 const defaultMilestoneSummarizer: MilestoneSummarizer = async (
   layers,
@@ -307,16 +320,20 @@ async function maybeRollover(
     // Archive the pre-rollover layers only once the rollover actually happened
     // — a failed summarization keeps the full reports in the layers, and a
     // stray epoch_N file would describe an epoch that never existed.
-    writeSnapshot(
-      join(epistemePaths(dir).tmp, `epoch_${epoch}_layers.md`),
+    writeRawSnapshot(
+      dir,
+      `epoch_${epoch}_layers.md`,
       `epoch ${epoch} layers`,
       buildEpistemeSummary(initial),
     );
-    const completed = completedStepIds(reports, initial.milestones ?? []);
+    // Only the IDs this epoch archives: `completedStepIds` unions every
+    // milestone, so a cumulative list here would re-pay earlier epochs in
+    // every later one and grow the permanent layer quadratically.
+    const archivedNow = newlyArchivedStepIds(reports, initial.milestones ?? []);
     const milestone = {
       n: epoch,
-      text: buildMilestoneText([...completed], digest),
-      completed: [...completed],
+      text: buildMilestoneText(archivedNow, digest),
+      completed: archivedNow,
     };
     return {
       layers: {
@@ -396,11 +413,7 @@ export async function handleSessionBeforeCompact(
     firstKeptEntryId = boundaryId;
     if (mode === "step") {
       const id = stepId ?? String(stepN ?? 0);
-      writeSnapshot(
-        join(epistemePaths(dir).tmp, `step_${id}_raw.md`),
-        `step ${id}`,
-        serialized,
-      );
+      writeRawSnapshot(dir, `step_${id}_raw.md`, `step ${id}`, serialized);
     }
   } else {
     mode = "plain";
@@ -458,9 +471,6 @@ export async function handleSessionBeforeCompact(
       version: EPISTEME_VERSION,
       stepN,
       stepId,
-      reportFiles: (layers.reports ?? [])
-        .map((r) => r.n)
-        .filter((n): n is number => n !== undefined),
       reportIds: (layers.reports ?? []).map((r) => r.key),
       llmSummary: llm !== undefined,
       rawFallback,
