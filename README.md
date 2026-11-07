@@ -83,7 +83,13 @@ base PLAN is required before `advance` is accepted.
    mode cuts at that sentinel and leaves only the deterministic episteme
    summary—no pi LLM tail. A successful step phase also writes raw context to
    `<session>.pi_episteme/tmp/step_S1_raw.md`; mention that path in the report.
-   Merely creating the sentinel does not create a summary or snapshot.
+   Merely creating the sentinel does not create a summary or snapshot. Only the
+   24 newest snapshots (steps and epochs together) are kept in `tmp/`. One phase
+   may be pending at a time: a second `advance` in the same turn is refused
+   instead of being silently merged into the first phase's compaction. If
+   building the episteme summary itself fails, that compaction is **cancelled**
+   rather than handed back to pi, because pi would then summarize the raw
+   conversation and the layers would be gone.
 5. Other enabled-session compactions (overflow or `/episteme compact`) use plain
    mode. They keep pi's normal retained tail, filter episteme layers out of the
    plain summarizer's input, and append its ephemeral-work summary after the
@@ -118,8 +124,10 @@ When the budget is exceeded and STEP reports exist, pi-episteme:
 1. saves the full pre-rollover layers to `tmp/epoch_N_layers.md`;
 2. asks the milestone summarizer for a durable digest—the milestone
    summarizer intentionally receives the **full layers**, including reports;
-3. appends MILESTONE-N with a preserved `Completed-Steps` ID list and clears
-   the individual reports after successful summarization.
+3. appends MILESTONE-N whose `Completed-Steps` lists only the IDs **that epoch**
+   closed — progress, step unlocking and immutability read the union over every
+   milestone, so repeating earlier epochs' IDs would only re-pay them forever —
+   and clears the individual reports after successful summarization.
 
 If milestone summarization fails, the full reports remain in the layers; no
 progress is discarded. This is different from plain summarization, from which
@@ -131,10 +139,17 @@ layers are filtered.
 degraded continuation, it queues the next unfinished plan item. Pi checks its own
 threshold between turns — right after a tool result is appended, before the run
 settles — so a threshold or overflow compaction can close the phase first; the
-continuation is then kept as a debt and queued at the next settle instead of
-disappearing with the consumed phase request. `/episteme pause` suppresses only
-auto-continue, not execution or compaction; `/episteme resume` re-enables it and
-queues the next item when idle.
+continuation is then kept as a debt and paid by that compaction's own completion
+(a hand-run `/episteme compact` has no continuation of its own, so the debt is
+what keeps the pipeline moving) or at the next settle. A debt is dropped rather
+than paid later when pi reports the compaction failed (`session_compact_failed`
+for `threshold`/`overflow`): the phase never closed, so the next item is queued
+immediately instead of at some unrelated settle. `pi.sendUserMessage` is
+fire-and-forget and pi rejects a prompt while a compaction runs, so the queueing
+checks `ctx.isIdle()` first and turns a busy pi into the same debt. `/episteme
+pause` suppresses only auto-continue, not execution or compaction;
+`/episteme resume` re-enables it and queues the next item when idle — never a
+second time for an item whose continuation is already in flight.
 
 The TUI shows plan progress, or the current on/off/paused state while there is
 no plan to show.
@@ -181,8 +196,10 @@ adds no runtime package dependency.
   position; it must be an integer of at least 1. String IDs use
   `[A-Za-z0-9][A-Za-z0-9_-]*`.
 - `episteme(action="status")` — show current state and usage/status estimates.
-- `/episteme` — show status; `/episteme compact` — request manual compaction;
-  `/episteme reset` — confirm and delete this session's raw snapshots. An
+- `/episteme` — show status; `/episteme compact` — request manual compaction (a
+  pending phase is consumed as a phase compaction and its auto-continue is still
+  delivered); `/episteme reset` — confirm and delete this session's raw
+  snapshots. An
   unknown subcommand says so instead of silently showing status.
 - `/episteme pause` and `/episteme resume` — pause/resume auto-continue.
 - `/episteme-on` — enable the mode for this session.
