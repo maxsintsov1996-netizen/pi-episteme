@@ -1424,7 +1424,9 @@ const main = async () => {
 
   console.log("index.ts — extension wiring + tool");
 
-  const factory = (await jiti.import(join(here, "index.ts"))).default;
+  const indexModule = await jiti.import(join(here, "index.ts"));
+  const factory = indexModule.default;
+  const { isCancellation } = indexModule;
   const handlers = {};
   const tools = {};
   const commands = {};
@@ -3153,6 +3155,89 @@ implemented parser; files: src/parser.ts; tests green
     await handlers.agent_settled[0]({ type: "agent_settled" }, idle);
     assert.equal(continuedMessages.length, 1, "the next settle delivers it");
     assert.match(String(continuedMessages[0]), /execute S1/);
+  });
+
+  await test("only pi's cancellation keeps a boundary; 'canceled' noise does not", async () => {
+    assert.ok(isCancellation(new Error("Compaction cancelled")));
+    assert.ok(
+      isCancellation(Object.assign(new Error("aborted"), { name: "AbortError" })),
+    );
+    // a real failure whose text merely mentions a cancellation
+    assert.ok(
+      !isCancellation(new Error("Compaction failed: The operation was canceled")),
+    );
+    assert.ok(!isCancellation(new Error("Nothing to compact (session too small)")));
+
+    const ctx = enabledCtx();
+    await commands["episteme-on"].handler("", ctx);
+    seedStepDone(4);
+    const accepted = await exec(
+      "cancel-1",
+      { action: "advance", step: 1 },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.ok(!accepted.isError, accepted.content[0].text);
+    let requested = null;
+    await handlers.agent_settled[0](
+      { type: "agent_settled" },
+      { ...ctx, compact: (opts) => (requested = opts) },
+    );
+    requested.onError(new Error("Compaction failed: The operation was canceled"));
+    const status = await exec(
+      "cancel-status",
+      { action: "status" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.ok(
+      status.content[0].text.includes("pending: none"),
+      "a genuine failure drops the phase instead of retrying it forever",
+    );
+  });
+
+  await test("pi's failed auto-compaction releases the debt instead of firing it later", async () => {
+    const { notes, ctx } = uiNotes(enabledCtx());
+    await commands["episteme-on"].handler("", ctx);
+    const res = await owePhase(ctx, "failed-auto");
+    assert.equal(res.compaction.details.episteme.mode, "step");
+    continuedMessages.length = 0;
+    handlers.session_compact_failed[0](
+      {
+        type: "session_compact_failed",
+        reason: "threshold",
+        errorMessage: "Context overflow recovery failed",
+        aborted: false,
+        willRetry: false,
+        fromExtension: true,
+      },
+      ctx,
+    );
+    assert.ok(
+      notes.some(([, message]) => message.includes("did not close")),
+      "the failed compaction is visible, not silent",
+    );
+    assert.equal(continuedMessages.length, 1, "the plan still moves on now");
+    const status = await exec(
+      "failed-auto-status",
+      { action: "status" },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.ok(status.content[0].text.includes("deferred=1"));
+    continuedMessages.length = 0;
+    await handlers.agent_settled[0](
+      { type: "agent_settled" },
+      noCompact(ctx),
+    );
+    assert.equal(
+      continuedMessages.length,
+      0,
+      "no stale continuation at a random later settle",
+    );
   });
 
   rmSync(workDir, { recursive: true, force: true });

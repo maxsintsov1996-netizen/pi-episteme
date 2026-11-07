@@ -86,13 +86,16 @@ const EPHEMERAL_DIR_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 /**
  * pi exposes no typed cancellation error for a rejected compaction: it throws
  * Error("Compaction cancelled") from its own layer and AbortError from the
- * transport. Both shapes have to be recognised, and the match stays textual
- * because there is nothing better to match on upstream.
+ * transport. Those two exact shapes are what pi itself compares
+ * (agent-session.js), and the match must stay that narrow: pi wraps real
+ * failures as `Compaction failed: <message>`, and a transport error that merely
+ * says "canceled" would otherwise be read as a user Esc — keeping a stale phase
+ * boundary alive and skipping the deferred-continuation path.
  */
-function isCancellation(err: unknown): boolean {
+export function isCancellation(err: unknown): boolean {
   if (err instanceof Error && err.name === "AbortError") return true;
-  const message = err instanceof Error ? err.message : String(err);
-  return /cancel/i.test(message);
+  const message = (err instanceof Error ? err.message : String(err)).trim();
+  return /^Compaction cancelled\b/i.test(message);
 }
 
 const toolText = (text: string, isError = false): ToolResult => ({
@@ -783,6 +786,30 @@ export default function (pi: ExtensionAPI) {
   // The plan/reports live in the conversation, so every finished turn (and
   // every compaction) can change what the dashboard shows.
   pi.on("turn_end", (_event, ctx) => {
+    updateWidget(ctx);
+  });
+
+  // pi's own threshold/overflow attempts never reach our ctx.compact onError,
+  // so their fallout is handled here.
+  pi.on("session_compact_failed", (event, ctx) => {
+    // Manual requests (ours included) are reported through onError instead.
+    if (event.reason === "manual") return;
+    // Esc: the boundary survives and the phase is retried, exactly as the
+    // onError path treats a cancellation.
+    if (event.aborted) return;
+    if (!rt.continueOwed) return;
+    // Our handler already closed the phase, but the compaction was rolled back
+    // underneath it, so the debt no longer belongs to a closed phase: firing it
+    // at some unrelated settle later would ask for a step at a random moment.
+    rt.continueOwed = false;
+    deferredReason = event.errorMessage ?? "compaction failed";
+    stats.deferred += 1;
+    if (ctx.hasUI)
+      ctx.ui.notify(
+        `pi-episteme: pi's ${event.reason} compaction failed (${deferredReason}); the phase did not close and its reports stay in context. Continuing with the next plan item.`,
+        "warning",
+      );
+    if (enabled && autoContinue) autoContinueNext(ctx);
     updateWidget(ctx);
   });
 
