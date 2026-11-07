@@ -942,6 +942,53 @@ const main = async () => {
     assert.ok(seen.plan.includes("- [ ] write parser"));
   });
 
+  await test("phase mode: pi's recent tail is never a dedup source", async () => {
+    // pi would keep m2 (its keepRecentTokens tail) and discard only m1, but a
+    // phase compaction moves the saved cut to `pb`, which comes AFTER m2 — so
+    // nothing of m2 survives. The layers written there must still be re-emitted
+    // canonically, or the newest STEP report is lost from the context.
+    const planS =
+      "/*EPISTEME::PLAN::v1*/\n- [id:S1] write parser\n- [id:S2] add tests\n/*EPISTEME::END::PLAN::v1*/";
+    const stepS1 =
+      "/*EPISTEME::STEP-S1::v1*/\ndid S1; files: src/p.ts; npm test green\n/*EPISTEME::END::STEP-S1::v1*/";
+    const event = makeEvent({
+      firstKept: "m2",
+      messages: [userMsg("build a parser", 1)],
+      branchEntries: [
+        { type: "session", id: "h" },
+        { type: "message", id: "m1", message: userMsg("build a parser", 1) },
+        {
+          type: "message",
+          id: "m2",
+          message: assistantMsg(`notes\n${R}\n\n${planS}\n\n${stepS1}`, 2),
+        },
+        { type: "custom", id: "pb", customType: "episteme-phase-boundary" },
+        { type: "message", id: "m3", message: assistantMsg("starting S2", 3) },
+      ],
+    });
+    const res = await handleSessionBeforeCompact(
+      event,
+      makeCtx(),
+      makeRt({ kind: "step", stepId: "S1", boundaryId: "pb" }),
+    );
+    assert.ok(res?.compaction);
+    assert.equal(res.compaction.details.episteme.mode, "step");
+    assert.equal(res.compaction.firstKeptEntryId, "pb");
+    assert.equal(res.compaction.details.episteme.dedupedWithTail, undefined);
+    // the context pi saves is the summary + entries from `pb` onward; every
+    // layer must still be extractable from it
+    const after = episteme.extractLayers(
+      [res.compaction.summary, "starting S2"].join("\n\n"),
+    );
+    assert.ok(after?.research?.includes("stack: node"), "RESEARCH survived");
+    assert.ok(after?.plan?.includes("- [id:S1] write parser"), "PLAN survived");
+    assert.deepEqual(
+      (after?.reports ?? []).map((r) => r.key),
+      ["S1"],
+      "the just-completed report survived",
+    );
+  });
+
   await test("previousLlmTail parses a deduped (subset) canonical prefix", () => {
     const subset = [
       episteme.EPISTEME_MARKER,

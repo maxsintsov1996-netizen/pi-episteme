@@ -377,15 +377,19 @@ export async function handleSessionBeforeCompact(
     convertToLlm(messagesToDiscard),
   );
 
-  const firstKeptIndex = branchEntries.findIndex(
-    (entry: { id: string }) => entry.id === preparation.firstKeptEntryId,
-  );
-  const keptMessages =
-    firstKeptIndex < 0
+  // Context messages carried by the branch from `entryId` (inclusive) to its
+  // end. An entry id that is not on the branch retains nothing.
+  const messagesAfter = (entryId: string): ConversationMessage[] => {
+    const index = branchEntries.findIndex(
+      (entry: { id: string }) => entry.id === entryId,
+    );
+    return index < 0
       ? []
       : branchEntries
-          .slice(firstKeptIndex)
+          .slice(index)
           .flatMap((entry) => sessionEntryToContextMessages(entry as never));
+  };
+  const keptMessages = messagesAfter(preparation.firstKeptEntryId);
   const keptSerialized = serializeConversation(convertToLlm(keptMessages));
   const serialized = [discardedSerialized, keptSerialized]
     .filter((text) => text.length > 0)
@@ -455,9 +459,18 @@ export async function handleSessionBeforeCompact(
     }
   }
 
+  // Dedup may only run against what the SAVED cut really retains. A phase
+  // compaction moves the cut to the boundary entry, which is strictly later
+  // than pi's own cut (pi keeps its recent `keepRecentTokens` tail, and the
+  // boundary is appended after the turn). Deduping against pi's tail there
+  // would drop the blocks the model just wrote out of the summary and then
+  // discard them with the span before the boundary — losing the newest STEP
+  // report (or a fresh PLAN) from the context outright.
+  const retainedMessages =
+    mode === "plain" ? keptMessages : messagesAfter(firstKeptEntryId);
   const { summary: epistemeSummary, deduped } = canonicalLayerSummary(
     layers,
-    assistantText(keptMessages).join(SEP),
+    assistantText(retainedMessages).join(SEP),
   );
   const tail = llm
     ? normalizeText(llm.summary)
