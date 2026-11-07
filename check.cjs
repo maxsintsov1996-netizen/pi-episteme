@@ -2943,6 +2943,21 @@ implemented parser; files: src/parser.ts; tests green
       ),
     );
   };
+  const uiNotes = (ctx) => {
+    const notes = [];
+    return {
+      notes,
+      ctx: {
+        ...ctx,
+        waitForIdle: async () => {},
+        ui: {
+          notify: (message, level) => notes.push([level ?? "info", String(message)]),
+          setWidget: () => {},
+        },
+      },
+    };
+  };
+
   await test("manual /episteme compact delivers the continuation of the phase it closed", async () => {
     const ctx = enabledCtx();
     await commands["episteme-on"].handler("", ctx);
@@ -2981,6 +2996,60 @@ implemented parser; files: src/parser.ts; tests green
     requested.onComplete({});
     assert.equal(continuedMessages.length, 1, "the owed continuation is delivered");
     assert.match(String(continuedMessages[0]), /execute 2: "add tests"/);
+  });
+
+  await test("a failing phase compaction cancels instead of handing pi the raw layers", async () => {
+    const { notes, ctx } = uiNotes(enabledCtx());
+    await commands["episteme-on"].handler("", ctx);
+    seedStepDone(4);
+    // No leaf id -> the phase boundary cannot be named and the handler fails.
+    const broken = {
+      ...ctx,
+      sessionManager: { ...tCtx.sessionManager, getLeafId: () => null },
+    };
+    const accepted = await exec(
+      "throw-1",
+      { action: "advance", step: 1 },
+      undefined,
+      undefined,
+      broken,
+    );
+    assert.ok(!accepted.isError, accepted.content[0].text);
+    let res;
+    let threw = null;
+    try {
+      res = await handlers.session_before_compact[0](
+        makeEvent({
+          reason: "threshold",
+          messages: [
+            assistantMsg(
+              `${PLAN1_DONE}\n/*EPISTEME::STEP-1::v1*/\nparser landed\n/*EPISTEME::END::STEP-1::v1*/`,
+            ),
+          ],
+        }),
+        broken,
+      );
+    } catch (err) {
+      threw = err;
+    }
+    // pi swallows a throwing session_before_compact handler and then summarizes
+    // the raw conversation itself: the layers would be gone with no warning.
+    assert.equal(threw, null, "the handler must not throw");
+    assert.equal(res?.cancel, true, "cancelled, so the context stays intact");
+    assert.ok(
+      notes.some(([, message]) => message.includes("layers are intact")),
+      "the user is told what happened",
+    );
+    const status = await exec(
+      "throw-status",
+      { action: "status" },
+      undefined,
+      undefined,
+      broken,
+    );
+    assert.ok(status.content[0].text.includes("pending: step:1"), "the phase is kept");
+    assert.ok(status.content[0].text.includes("deferred=1"));
+    await clearPending();
   });
 
   rmSync(workDir, { recursive: true, force: true });

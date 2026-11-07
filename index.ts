@@ -37,6 +37,7 @@ import { Type } from "typebox";
 import { resolveEpistemeSettings } from "./config.ts";
 import {
   handleSessionBeforeCompact,
+  type BeforeCompactResult,
   type EpistemeDetails,
   type EpistemeRuntime,
 } from "./compaction.ts";
@@ -669,7 +670,29 @@ export default function (pi: ExtensionAPI) {
       dropPending();
       return;
     }
-    const result = await handleSessionBeforeCompact(event, ctx, rt);
+    let result: BeforeCompactResult | undefined;
+    try {
+      result = await handleSessionBeforeCompact(event, ctx, rt);
+    } catch (err) {
+      // A throwing session_before_compact handler is swallowed by pi
+      // (ExtensionRunner.emit reports it as an extension error and returns no
+      // result), so pi goes on to run its OWN summarization over the raw
+      // conversation — which folds the EPISTEME blocks into prose and loses the
+      // layers for good, with nothing to warn about because no episteme result
+      // was ever saved. Cancelling is the only outcome that leaves the context
+      // intact; the pending phase and its boundary survive for a retry.
+      const message = err instanceof Error ? err.message : String(err);
+      compactOurs = false;
+      deferredReason = message;
+      stats.deferred += 1;
+      if (ctx.hasUI)
+        ctx.ui.notify(
+          `pi-episteme: this compaction was cancelled (${message}); the episteme layers are intact. The phase is kept and retried at the next advance.`,
+          "warning",
+        );
+      updateWidget(ctx);
+      return { cancel: true };
+    }
     compactOurs = result?.compaction !== undefined;
     return result;
   });
