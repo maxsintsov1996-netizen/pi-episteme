@@ -533,11 +533,15 @@ export default function (pi: ExtensionAPI) {
       customInstructions,
       onComplete: () => {
         deferredReason = undefined;
-        // This request delivered its own continuation through onDone; keep
-        // agent_settled from queueing a second one for the same phase.
-        rt.continueOwed = false;
         if (ctx.hasUI) ctx.ui.notify("pi-episteme: compaction finished", "info");
-        onDone?.();
+        // Whatever continuation the closed phase owes is delivered here, in
+        // every case. `onDone` is absent for a manual /episteme compact, and
+        // that request still consumes a pending phase (it picks plan/step mode)
+        // — clearing the debt without a delivery stalled the pipeline silently.
+        const owed = rt.continueOwed;
+        rt.continueOwed = false;
+        if (onDone) onDone();
+        else if (owed && enabled && autoContinue) autoContinueNext(ctx);
       },
       onError: (err) => {
         const cancelled = isCancellation(err);

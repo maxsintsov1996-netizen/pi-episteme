@@ -2916,6 +2916,73 @@ implemented parser; files: src/parser.ts; tests green
     handlers.session_start[0]({ type: "session_start" }, tCtx);
   });
 
+  // ---- phase bookkeeping: one phase per turn, no lost continuations ------
+
+  // A branch with step 1 reported and two items still open, ready for advance.
+  const seedStepDone = (planItems, report = "1") => {
+    branch.length = 0;
+    branch.push({
+      type: "compaction",
+      id: `c-seed-${planItems}`,
+      summary: episteme.buildEpistemeSummary({
+        research: "stack: node",
+        plan: [
+          "- [ ] write parser",
+          "- [ ] add tests",
+          "- [ ] ship it",
+          "- [ ] write docs",
+        ]
+          .slice(0, planItems)
+          .join("\n"),
+      }),
+    });
+    branch.push(
+      branchMsg(
+        `/*EPISTEME::STEP-${report}::v1*/\nparser landed\n/*EPISTEME::END::STEP-${report}::v1*/`,
+        `b-seed-${planItems}`,
+      ),
+    );
+  };
+  await test("manual /episteme compact delivers the continuation of the phase it closed", async () => {
+    const ctx = enabledCtx();
+    await commands["episteme-on"].handler("", ctx);
+    seedStepDone(4);
+    const accepted = await exec(
+      "manual-1",
+      { action: "advance", step: 1 },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.ok(!accepted.isError, accepted.content[0].text);
+
+    let requested = null;
+    continuedMessages.length = 0;
+    await commands.episteme.handler("compact", {
+      ...ctx,
+      waitForIdle: async () => {},
+      compact: (opts) => {
+        requested = opts;
+      },
+    });
+    assert.ok(requested?.onComplete, "the manual command requested a compaction");
+    // pi runs it, and the pending phase makes it a phase compaction.
+    const res = await handlers.session_before_compact[0](
+      makeEvent({
+        messages: [
+          assistantMsg(
+            `${PLAN1_DONE}\n/*EPISTEME::STEP-1::v1*/\nparser landed\n/*EPISTEME::END::STEP-1::v1*/`,
+          ),
+        ],
+      }),
+      ctx,
+    );
+    assert.equal(res.compaction.details.episteme.mode, "step");
+    requested.onComplete({});
+    assert.equal(continuedMessages.length, 1, "the owed continuation is delivered");
+    assert.match(String(continuedMessages[0]), /execute 2: "add tests"/);
+  });
+
   rmSync(workDir, { recursive: true, force: true });
   console.log(`\n${passed} tests passed`);
 };
