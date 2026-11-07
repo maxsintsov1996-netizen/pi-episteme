@@ -1525,6 +1525,19 @@ const main = async () => {
   // establish the session (sets rt.epistemeDir from the session file path)
   handlers.session_start[0]({ type: "session_start" }, tCtx);
 
+  // Drain a pending phase the way a failing turn end does, so a phase accepted
+  // by one test cannot leak into the next (advance allows one phase at a time).
+  const clearPending = async () => {
+    await handlers.agent_settled[0](
+      { type: "agent_settled" },
+      {
+        ...tCtx,
+        compact: (opts) =>
+          opts.onError(new Error("Nothing to compact (session too small)")),
+      },
+    );
+  };
+
   // Anchor-display tests: pin the effective config (project settings file +
   // a session_start re-resolve) so the assertions never depend on the
   // machine's real global settings.
@@ -2010,6 +2023,7 @@ const main = async () => {
       tCtx,
     );
     assert.ok(!e3.isError, "STEP-1 report is the completion record");
+    await clearPending();
   });
 
   await test("advance: plan accepted -> first compaction queued", async () => {
@@ -2025,6 +2039,7 @@ const main = async () => {
     assert.ok(!r.isError);
     assert.ok(r.content[0].text.includes("write parser"));
     assert.ok(r.content[0].text.includes("Next: execute 1"));
+    await clearPending();
   });
 
   await test("advance step: accepted with immutable plan + STEP block", async () => {
@@ -2055,6 +2070,7 @@ implemented parser; files: src/parser.ts; tests green
     assert.ok(!r.isError);
     assert.ok(r.content[0].text.includes("step_1_raw.md"));
     assert.ok(r.content[0].text.includes("add tests"));
+    await clearPending();
   });
 
   await test("status: reports extracted plan state", async () => {
@@ -2073,14 +2089,38 @@ implemented parser; files: src/parser.ts; tests green
   });
 
   await test("agent_settled fires queued compact", async () => {
+    // Self-contained: accept the phase here rather than inheriting the pending
+    // request of the previous test.
+    const accepted = await exec(
+      "a6q",
+      { action: "advance", step: 1 },
+      undefined,
+      undefined,
+      tCtx,
+    );
+    assert.ok(!accepted.isError, accepted.content[0].text);
     let compacted = null;
-    const ctx = { ...tCtx, compact: (opts) => (compacted = opts) };
-    await handlers.agent_settled[0]({ type: "agent_settled" }, ctx);
+    const settleCtx = { ...tCtx, compact: (opts) => (compacted = opts) };
+    await handlers.agent_settled[0]({ type: "agent_settled" }, settleCtx);
     assert.ok(compacted);
     assert.ok(compacted.customInstructions.startsWith("step:1"));
+    await clearPending();
   });
 
   await test("queued step survives agent_settled and is consumed by compaction", async () => {
+    // Accept the phase and let agent_settled queue it, as a real turn does.
+    const accepted = await exec(
+      "a6r",
+      { action: "advance", step: 1 },
+      undefined,
+      undefined,
+      tCtx,
+    );
+    assert.ok(!accepted.isError, accepted.content[0].text);
+    await handlers.agent_settled[0](
+      { type: "agent_settled" },
+      { ...tCtx, compact: () => {} },
+    );
     const event = makeEvent({
       previousSummary: episteme.buildEpistemeSummary({
         research: "stack: node",
@@ -2139,17 +2179,6 @@ implemented parser; files: src/parser.ts; tests green
 
   // These tests queue a phase compaction; release the marker through pi's own
   // clearing path (failed manual compaction) so it cannot leak downstream.
-  const clearPending = async () => {
-    await handlers.agent_settled[0](
-      { type: "agent_settled" },
-      {
-        ...tCtx,
-        compact: (opts) =>
-          opts.onError(new Error("Nothing to compact (session too small)")),
-      },
-    );
-  };
-
   await test("advance: a re-emitted PLAN keeps the reports and stays silent", async () => {
     branch.length = 0;
     branch.push({
@@ -2182,6 +2211,7 @@ implemented parser; files: src/parser.ts; tests green
     assert.ok(!text.includes("item count"), text);
     const st = await exec("a7s", { action: "status" }, undefined, undefined, tCtx);
     assert.ok(st.content[0].text.includes("reports: [1]"));
+    await clearPending();
   });
 
   await test("advance: a new RESEARCH cycle names the dropped reports", async () => {
@@ -2215,6 +2245,7 @@ implemented parser; files: src/parser.ts; tests green
     assert.ok(!r.isError, text);
     assert.ok(text.includes("new task cycle"), text);
     assert.ok(text.includes("[1,2]"), text);
+    await clearPending();
   });
 
   await test("advance: legacy plan insertion no longer remaps a completed report", async () => {
@@ -3050,6 +3081,78 @@ implemented parser; files: src/parser.ts; tests green
     assert.ok(status.content[0].text.includes("pending: step:1"), "the phase is kept");
     assert.ok(status.content[0].text.includes("deferred=1"));
     await clearPending();
+  });
+
+  await test("a second advance in the same turn is refused, not merged into one phase", async () => {
+    const ctx = enabledCtx();
+    await commands["episteme-on"].handler("", ctx);
+    seedStepDone(4);
+    const first = await exec(
+      "twice-1",
+      { action: "advance", step: 1 },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.ok(!first.isError, first.content[0].text);
+    const again = await exec(
+      "twice-2",
+      { action: "advance", step: 2 },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.ok(again.isError, "one phase per turn");
+    assert.ok(again.content[0].text.includes("already waiting for its phase compaction"));
+    await clearPending();
+  });
+
+  await test("resume never queues the same plan item twice", async () => {
+    const ctx = uiNotes(enabledCtx()).ctx;
+    await commands["episteme-on"].handler("", ctx);
+    branch.length = 0;
+    branch.push(
+      branchMsg(
+        `${R}\n${episteme.epistemeBlock("PLAN", "- [id:S1] first\n- [id:S2] second")}`,
+        "dup-b",
+      ),
+    );
+    continuedMessages.length = 0;
+    await commands.episteme.handler("resume", ctx);
+    assert.equal(continuedMessages.length, 1, "resume arms the continuation once");
+    assert.match(String(continuedMessages[0]), /execute S1/);
+    await commands.episteme.handler("resume", ctx);
+    assert.equal(continuedMessages.length, 1, "an in-flight item is not queued again");
+    // once the item reports, the next one may be queued normally
+    branch.push(
+      branchMsg(episteme.epistemeBlock("STEP-S1", "first done"), "dup-b2"),
+    );
+    await commands.episteme.handler("resume", ctx);
+    assert.equal(continuedMessages.length, 2, "the completed item releases the guard");
+    assert.match(String(continuedMessages[1]), /execute S2/);
+  });
+
+  await test("a continuation is deferred while pi is busy, not lost in a rejected send", async () => {
+    const ctx = { ...uiNotes(enabledCtx()).ctx, isIdle: () => false };
+    await commands["episteme-on"].handler("", ctx);
+    branch.length = 0;
+    branch.push(
+      branchMsg(
+        `${R}\n${episteme.epistemeBlock("PLAN", "- [id:S1] first\n- [id:S2] second")}`,
+        "busy-b",
+      ),
+    );
+    continuedMessages.length = 0;
+    await commands.episteme.handler("resume", ctx);
+    assert.equal(
+      continuedMessages.length,
+      0,
+      "pi rejects prompts during a compaction, so nothing is sent",
+    );
+    const idle = { ...ctx, isIdle: () => true };
+    await handlers.agent_settled[0]({ type: "agent_settled" }, idle);
+    assert.equal(continuedMessages.length, 1, "the next settle delivers it");
+    assert.match(String(continuedMessages[0]), /execute S1/);
   });
 
   rmSync(workDir, { recursive: true, force: true });

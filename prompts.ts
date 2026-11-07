@@ -41,6 +41,7 @@ Pipeline:
 3. Write PLAN with one self-contained item per line in the format "- [id:S1] action". IDs are unique and stable (S1, S2, … or meaningful short IDs). Include files/modules, exact actions, verification commands, and expected outcomes. Call episteme(action="advance") after writing a new RESEARCH and its new base PLAN.
 4. Execute one item at a time. After its code and checks, write a 10–30 line STEP-ID report: work done, files, verification results, decisions, and risks. Call episteme(action="advance", step="ID"). The raw context is saved to ${p.tmp}/step_ID_raw.md when phase compaction succeeds; mention that path in the report.
 5. Reports and MILESTONE digests are the information store for later steps. Do not omit key facts.
+6. One advance call per turn. A phase is folded when the agent settles, so a second advance in the same turn is refused: finish the turn, let the compaction run, then advance the next phase.
 
 Rules:
 - You are the only executor: implement items yourself, in plan order. The layers survive compaction by structural extraction (they are re-emitted verbatim, not paraphrased), so a report you wrote stays readable years later in a compacted session — keep it factual and self-contained.

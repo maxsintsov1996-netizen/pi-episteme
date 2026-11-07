@@ -253,6 +253,20 @@ function actAdvance(
   ctx: ExtensionContext,
   step?: number | string,
 ): ToolResult {
+  // One phase per turn. Overwriting a pending request silently merged two
+  // phases into the turn's single compaction: the first step never got its own
+  // cut or raw snapshot, and the boundary entry already appended for it was
+  // orphaned while agent_settled appended a second one.
+  if (rt.pending) {
+    return toolText(
+      `Error: ${
+        rt.pending.kind === "step"
+          ? `step ${rt.pending.stepId}`
+          : "the plan phase"
+      } is already waiting for its phase compaction at the end of this turn. Finish this turn first (pi compacts it when the agent settles), then advance.`,
+      true,
+    );
+  }
   const layers = extractLayers(branchText(ctx));
   if (!layers)
     return toolText(
@@ -340,6 +354,8 @@ export default function (pi: ExtensionAPI) {
   let hideAnchors = initial.hideAnchors;
   let compactOurs = false;
   let deferredReason: string | undefined;
+  /** Plan item the current auto-continue message asks for, until it reports. */
+  let continuationQueuedFor: string | undefined;
   const stats = { compacted: 0, deferred: 0 };
   rt.ensureBoundary = (ctx) => {
     pi.appendEntry("episteme-phase-boundary", {
@@ -508,9 +524,37 @@ export default function (pi: ExtensionAPI) {
         return;
       }
       const id = itemId(plan, idx) ?? String(idx + 1);
+      // A queued continuation stays in flight until its step reports: pausing
+      // and resuming (or a leftover debt) must not ask for the same item twice.
+      const completed = completedStepIds(
+        layers.reports ?? [],
+        layers.milestones ?? [],
+      );
+      if (continuationQueuedFor && completed.has(continuationQueuedFor)) {
+        continuationQueuedFor = undefined;
+      }
+      if (continuationQueuedFor === id) {
+        if (ctx.hasUI)
+          ctx.ui.notify(
+            `pi-episteme: ${id} is already in flight (no STEP-${id} report yet) — not queueing a second continuation`,
+            "info",
+          );
+        return;
+      }
+      // pi rejects a prompt outright while a compaction is in progress, and
+      // sendUserMessage is fire-and-forget: its rejection goes to pi's
+      // extension-error channel, never to this call site. Asking for the idle
+      // state up front and deferring through the debt flag is the only way the
+      // continuation is neither lost nor reported as a mystery error.
+      if (typeof ctx.isIdle === "function" && !ctx.isIdle()) {
+        rt.continueOwed = true;
+        return;
+      }
+      continuationQueuedFor = id;
       pi.sendUserMessage(buildContinueMessage(id, itemText(plan, idx) ?? ""));
     } catch {
-      // The user can continue manually if the host rejects a queued message.
+      // A malformed layer state must never break the settle path: the user can
+      // always continue the plan by hand.
     }
   };
 
@@ -520,6 +564,7 @@ export default function (pi: ExtensionAPI) {
   const dropPending = (): void => {
     rt.pending = null;
     rt.continueOwed = false;
+    continuationQueuedFor = undefined;
   };
 
   const requestCompact = (
@@ -801,13 +846,20 @@ export default function (pi: ExtensionAPI) {
     parameters: EpistemeParams,
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       switch (params.action) {
-        case "advance":
+        case "advance": {
           if (!enabled)
             return toolText(
               "Error: pi-episteme is disabled. Run /episteme-on to enable it for this session, then call advance again.",
               true,
             );
-          return actAdvance(rt, ctx, params.step);
+          const advanced = actAdvance(rt, ctx, params.step);
+          if (rt.pending) {
+            // An accepted phase consumes the continuation that led to it, so
+            // the same plan item may legitimately be queued again afterwards.
+            continuationQueuedFor = undefined;
+          }
+          return advanced;
+        }
         case "status":
           return toolText(statusText(ctx));
         default:
